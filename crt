@@ -139,25 +139,26 @@ oci_unpack() {
     local digest
     for digest in $layers; do
         echo "  layer ${digest:7:12}..."
-        curl -fsSL \
+        (set -o pipefail; curl -fsSL \
             -H "Authorization: Bearer $token" \
             "${api_base}/blobs/${digest}" \
-            | tar -xf - -C "$rootfs" 2>/dev/null || true
+            | tar -xf - -C "$rootfs" 2>/dev/null) || {
+            echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
+            return 1
+        }
 
         # Process whiteout files for this layer before moving to the next
-        find "$rootfs" -name '.wh.*' | while read -r wh_file; do
+        while read -r wh_file; do
             local dir wh_name
             dir=$(dirname "$wh_file")
             wh_name=$(basename "$wh_file")
             if [ "$wh_name" = ".wh..wh..opq" ]; then
-                # Opaque whiteout: delete all non-whiteout entries in this directory
                 find "$dir" -mindepth 1 -not -name '.wh.*' -delete
             else
-                # Regular whiteout: delete the named target
                 rm -rf "$dir/${wh_name#.wh.}"
             fi
             rm -f "$wh_file"
-        done
+        done < <(find "$rootfs" -name '.wh.*')
     done
 }
 
