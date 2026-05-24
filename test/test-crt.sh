@@ -290,11 +290,18 @@ cat > "$MOCKS/curl" << MOCKEOF
 #!/bin/sh
 FIXTURES="\$(cd "\$(dirname "\$0")/../fixtures" && pwd)"
 url=""
-for arg in "\$@"; do case "\$arg" in http*) url="\$arg" ;; esac; done
+outfile=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        -o) outfile="\$2"; shift 2 ;;
+        http*) url="\$1"; shift ;;
+        *) shift ;;
+    esac
+done
 case "\$url" in
     *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
     */manifests/*) cat "\$FIXTURES/manifest.json" ;;
-    */blobs/*) echo blob >> "$CURL_LOG"; cat "\$CRT_HOME/.cache/layers/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;
+    */blobs/*) echo blob >> "$CURL_LOG"; if [ -n "\$outfile" ]; then cp "\$CRT_HOME/.cache/layers/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "\$outfile"; else cat "\$CRT_HOME/.cache/layers/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; fi ;;
     *) printf 'unhandled: %s\n' "\$url" >&2; exit 1 ;;
 esac
 MOCKEOF
@@ -307,7 +314,14 @@ cat > "$MOCKS/curl" << 'MOCKEOF'
 #!/bin/sh
 FIXTURES="$(cd "$(dirname "$0")/../fixtures" && pwd)"
 url=""
-for arg in "$@"; do case "$arg" in http*) url="$arg" ;; esac; done
+outfile=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) outfile="$2"; shift 2 ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
 case "$url" in
     *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
     */manifests/*) cat "$FIXTURES/manifest.json" ;;
@@ -316,7 +330,11 @@ case "$url" in
         mkdir -p "$tmpdir/bin"
         printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$tmpdir/bin/sh"
         chmod +x "$tmpdir/bin/sh"
-        tar -czf - -C "$tmpdir" .
+        if [ -n "$outfile" ]; then
+            tar -czf "$outfile" -C "$tmpdir" .
+        else
+            tar -czf - -C "$tmpdir" .
+        fi
         rm -rf "$tmpdir"
         ;;
     *) printf 'mock-curl: unhandled url: %s\n' "$url" >&2; exit 1 ;;

@@ -145,37 +145,41 @@ oci_unpack() {
         local blob="$cache_dir/${digest//:/-}"
         echo "  layer ${digest:7:12}..."
 
-        if [ -f "$blob" ]; then
-            tar -xzf "$blob" -C "$rootfs" 2>/dev/null || {
-                echo "Error: failed to unpack cached layer ${digest:7:12}" >&2
-                return 1
-            }
-        else
+        # Ensure blob is cached
+        if [ ! -f "$blob" ]; then
             local blob_tmp="${blob}.tmp"
-            (set -o pipefail; curl -fsSL \
+            curl -fsSL \
                 -H "Authorization: Bearer $token" \
                 "${api_base}/blobs/${digest}" \
-                | tee "$blob_tmp" \
-                | tar -xzf - -C "$rootfs" 2>/dev/null) || {
+                -o "$blob_tmp" || {
                 rm -f "$blob_tmp"
-                echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
+                echo "Error: failed to download layer ${digest:7:12}" >&2
                 return 1
             }
             mv "$blob_tmp" "$blob"
         fi
 
-        # Process whiteout files for this layer before moving to the next
-        while read -r wh_file; do
-            local dir wh_name
-            dir=$(dirname "$wh_file")
-            wh_name=$(basename "$wh_file")
+        # Apply whiteouts from this layer's tar listing BEFORE extracting,
+        # so we only delete lower-layer content, not the current layer's files.
+        while IFS= read -r wh_path; do
+            wh_path="${wh_path#./}"
+            local wh_dir wh_name target
+            wh_dir="$(dirname "$wh_path")"
+            wh_name="$(basename "$wh_path")"
+            target="$rootfs/$wh_dir"
             if [ "$wh_name" = ".wh..wh..opq" ]; then
-                find "$dir" -mindepth 1 -not -name '.wh.*' -delete
+                find "${target:?}" -mindepth 1 -delete 2>/dev/null || true
             else
-                rm -rf "$dir/${wh_name#.wh.}"
+                rm -rf "${target:?}/${wh_name#.wh.}"
             fi
-            rm -f "$wh_file"
-        done < <(find "$rootfs" -name '.wh.*')
+        done < <(tar -tzf "$blob" 2>/dev/null | grep '\.wh\.' || true)
+
+        # Extract layer; remove whiteout markers (they've been applied above)
+        tar -xzf "$blob" -C "$rootfs" 2>/dev/null || {
+            echo "Error: failed to unpack layer ${digest:7:12}" >&2
+            return 1
+        }
+        find "$rootfs" -name '.wh.*' -delete
     done
 }
 
