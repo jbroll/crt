@@ -143,7 +143,7 @@ oci_unpack() {
         (set -o pipefail; curl -fsSL \
             -H "Authorization: Bearer $token" \
             "${api_base}/blobs/${digest}" \
-            | tar -xf - -C "$rootfs" 2>/dev/null) || {
+            | tar -xzf - -C "$rootfs" 2>/dev/null) || {
             echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
             return 1
         }
@@ -269,6 +269,8 @@ cmd_run() {
     exec unshare --user --map-root-user --mount --pid --uts --ipc -f \
         /bin/bash -c '
             rootfs=$1; userhome=$2; workdir=$3; shift 3
+            mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" "$rootfs/tmp" "$rootfs/etc"
+            touch "$rootfs/etc/resolv.conf"
             mount -t proc proc "$rootfs/proc"
             mount -t sysfs sysfs "$rootfs/sys"
             mount --bind /dev "$rootfs/dev"
