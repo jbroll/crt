@@ -152,6 +152,7 @@ Add `CRT_BIN` to your `PATH` and the binary behaves as if installed on the host.
 | `crt create <name>` (Void) | `xbps-install` |
 | `crt create <name> <image>` (OCI) | `curl`, `jq`, `tar` |
 | `crt run` / `crt enter` | `unshare`, `chroot` (util-linux) |
+| `crt setup` | root or `sudo` |
 
 `unshare` and `chroot` are in `util-linux`, present on any Linux system. `curl` and `jq` are only needed for OCI pulls.
 
@@ -196,7 +197,7 @@ Tests use PATH-based mocks (`test/mocks/`) that shadow system commands:
 | `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
 | `xbps-install` | xbps | Creates a minimal `bin/sh` skeleton in the rootfs |
 
-This lets the full `cmd_create` and `cmd_run` code paths run without root, namespaces, network, or xbps. 40 tests cover `parse_memory`, `read_config`, `write_config`, all three `create` dispatch paths, `run` flag and config merging, `list`, and `rm`.
+This lets the full `cmd_create` and `cmd_run` code paths run without root, namespaces, network, or xbps. 58 tests cover `parse_memory`, `read_config`, `write_config`, `parse_image_ref`, all three `create` dispatch paths, `run` flag and config merging, `list`, `rm`, OCI layer cache reuse, `export`, and `setup`.
 
 ## Limitations
 
