@@ -1,0 +1,3 @@
+#!/bin/sh
+# Mock mount: no-op (namespace not available in tests)
+exit 0

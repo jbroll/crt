@@ -1,0 +1,8 @@
+{
+  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+  "layers": [
+    {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Mock chroot: drop the rootfs argument, run the command on the host
+shift
+exec "$@"

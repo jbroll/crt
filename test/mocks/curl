@@ -1,0 +1,17 @@
+#!/bin/sh
+FIXTURES="$(cd "$(dirname "$0")/../fixtures" && pwd)"
+url=""
+for arg in "$@"; do case "$arg" in http*) url="$arg" ;; esac; done
+case "$url" in
+    *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
+    */manifests/*) cat "$FIXTURES/manifest.json" ;;
+    */blobs/*)
+        tmpdir=$(mktemp -d)
+        mkdir -p "$tmpdir/bin"
+        printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$tmpdir/bin/sh"
+        chmod +x "$tmpdir/bin/sh"
+        tar -czf - -C "$tmpdir" .
+        rm -rf "$tmpdir"
+        ;;
+    *) printf 'mock-curl: unhandled url: %s\n' "$url" >&2; exit 1 ;;
+esac

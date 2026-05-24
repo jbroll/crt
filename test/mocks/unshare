@@ -1,0 +1,9 @@
+#!/bin/sh
+# Mock unshare: skip all namespace flags, exec the remaining command directly
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --*|-f) shift ;;
+        *)      break ;;
+    esac
+done
+exec "$@"

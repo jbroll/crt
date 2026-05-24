@@ -1,0 +1,134 @@
+#!/bin/bash
+
+TestsRun=0
+TestsPassed=0
+TestsFailed=0
+ExitOnFail=0
+KeepTest=0
+SetMinusX=0
+
+while [ $# -gt 0 ] ; do
+    case $1 in
+      -help)
+cat 1>&2 << EOF
+	-c	cleanup
+	-k	keep temps
+	-e	exit on failure
+	-x	shell debug
+EOF
+	exit	;;
+      -c)   # Clean Up
+	    #
+	    rm -f *.tmp
+	    exit 0
+	    ;;
+      -k)   KeepTest=1	;;
+      -e)   ExitOnFail=1	;;
+      -x)	SetMinusX=1	;;
+      *)    Select=$1;;
+    esac
+    shift 
+done
+
+
+printf -- "Number	%-52s	Result	   Time\n" Test
+printf -- "------	%-52s	------	 ------\n" ----
+
+
+Test() {
+    Expect=Pass
+    if [ x"$1" = "x!" ] ; then Expect=Fail;  shift
+    fi
+
+    Title=$1; shift
+    TestsRun=`expr $TestsRun + 1`
+
+    printf "%6d	%-52s" 	$TestsRun "$Title" 1>&2
+
+    Start=`clock`
+    if [ "$SetMinusX" = 1 ] ; then
+        set -x
+    fi
+}
+
+Clock() {
+    Start=`clock`
+}
+
+TestCleanUp() {
+    Now=`clock`; Elapse=`calc $Now - $Start`
+
+    if [ $1 = $Expect ] ; then Result=Pass ; TestsPassed=`expr $TestsPassed + 1`
+    else                       Result=Fail ; TestsFailed=`expr $TestsFailed + 1`
+    fi
+    printf "	$Result	%7.3f\n" $Elapse 1>&2
+
+    if [ $Result = Fail -a $ExitOnFail = 1 ] ; then
+	exit 1
+    fi
+}
+
+Fail() {  TestCleanUp Fail; }
+Pass() {  TestCleanUp Pass; }
+
+CompareArgs() {
+    while [ $# -ge 2 ] ; do
+	x=$1
+	y=$2
+	shift; shift
+
+	if [ "$x" != "$y" ] ; then
+	    echo 	> /dev/tty
+	    echo ":$x:"	> /dev/tty
+	    echo ":$y:"	> /dev/tty
+
+	    Fail; return 1
+	fi
+    done
+
+    Pass; return 0
+}
+
+CompareEval() {
+    while [ $# -ge 2 ] ; do
+	x=`$1`
+	y=$2
+	shift; shift
+
+	if [ "$x" != "$y" ] ; then
+	    echo 	> /dev/tty
+	    echo ":$x:"	> /dev/tty
+	    echo ":$y:"	> /dev/tty
+
+	    Fail; return 1
+	fi
+    done
+
+    Pass; return 0
+}
+
+CompareFiles() {
+    if cmp "$1" "$2" ; then 	Pass; return 0
+    else 		    	Fail; return 1
+    fi
+}
+
+DiffFiles() {
+  while [ $# != 0 ] ; do
+    if diff "$1" "$2" ; then 	Pass; return 0
+    else 			Fail; return 1
+    fi
+    shift
+    shift
+  done
+}
+
+TestDone() {
+    if [ $KeepTest = 0 ] ; then rm -f *.tmp *.tmp.* TestOutput.*
+    fi
+
+    echo
+    echo "Failed $TestsFailed"
+    echo "Passed $TestsPassed of $TestsRun tests run."
+    exit 0
+}

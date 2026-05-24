@@ -1,0 +1,12 @@
+#!/bin/sh
+# Mock xbps-install: create a minimal rootfs skeleton
+# Real xbps-install uses -r <rootfs> as its first two args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r) rootfs="$2"; shift 2 ;;
+        *)  shift ;;
+    esac
+done
+mkdir -p "$rootfs/bin" "$rootfs/etc" "$rootfs/usr/bin"
+printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$rootfs/bin/sh"
+chmod +x "$rootfs/bin/sh"
