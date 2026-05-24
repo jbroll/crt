@@ -159,6 +159,24 @@ Each environment is a plain directory under `CRT_HOME`:
 
 Rootfs directories are self-contained and can be moved, copied, or archived with `tar`.
 
+## Testing
+
+```sh
+bash test/test-crt.sh
+```
+
+Tests use PATH-based mocks (`test/mocks/`) that shadow system commands:
+
+| Mock | Replaces | What it does |
+|---|---|---|
+| `unshare` | util-linux | Strips namespace flags, runs the inner script directly on the host |
+| `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
+| `mount` | util-linux | No-op (no namespace needed) |
+| `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
+| `xbps-install` | xbps | Creates a minimal `bin/sh` skeleton in the rootfs |
+
+This lets the full `cmd_create` and `cmd_run` code paths run without root, namespaces, network, or xbps. 40 tests cover `parse_memory`, `read_config`, `write_config`, all three `create` dispatch paths, `run` flag and config merging, `list`, and `rm`.
+
 ## Limitations
 
 - No network isolation (host network stack is shared)
