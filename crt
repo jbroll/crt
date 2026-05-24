@@ -248,7 +248,17 @@ apply_cgroup() {
         return 0
     fi
 
-    local cg="/sys/fs/cgroup/crt-$$"
+    local user_cg="/sys/fs/cgroup/user-$(id -u)"
+    if [ ! -d "$user_cg" ]; then
+        echo "Warning: cgroup not delegated for your user, resource limits not applied" >&2
+        echo "  Run 'sudo crt setup' to enable memory/cpu limits." >&2
+        return 0
+    fi
+
+    # Enable controllers in user's cgroup subtree (idempotent)
+    echo "+memory +cpu" > "$user_cg/cgroup.subtree_control" 2>/dev/null || true
+
+    local cg="$user_cg/crt-$$"
     if ! mkdir -p "$cg" 2>/dev/null; then
         echo "Warning: cannot create cgroup $cg, resource limits not applied" >&2
         return 0
