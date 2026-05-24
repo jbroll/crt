@@ -155,9 +155,13 @@ Each environment is a plain directory under `CRT_HOME`:
   bin/           ← CRT_BIN: exported wrapper scripts
     perl
     python
+  .cache/
+    layers/      ← OCI layer blobs, keyed by digest
 ```
 
 Rootfs directories are self-contained and can be moved, copied, or archived with `tar`.
+
+OCI layers are cached in `.cache/layers/` and reused across environments. There is no automatic eviction — run `rm -rf $CRT_HOME/.cache` to clear.
 
 ## Testing
 
@@ -180,6 +184,5 @@ This lets the full `cmd_create` and `cmd_run` code paths run without root, names
 ## Limitations
 
 - No network isolation (host network stack is shared)
-- OCI layers are cached at `$CRT_HOME/.cache/layers/` (no automatic eviction — `rm -rf $CRT_HOME/.cache` to clear)
 - No private registry authentication
 - Resource limits (`memory`/`cpus`) require cgroup v2 with user delegation; degrade gracefully with a warning if unavailable
