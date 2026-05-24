@@ -594,7 +594,7 @@ cmd_setup() {
     fi
 
     # 1. Immediate cgroup delegation
-    printf '+memory +cpu\n' >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || {
+    printf '+memory +cpu\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || {
         echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
     }
     local cg="/sys/fs/cgroup/user-${target_uid}"
@@ -632,20 +632,24 @@ _setup_runit() {
     cat > "$sv_dir/run" << 'RUNEOF'
 #!/bin/sh
 exec 2>&1
-for entry in $(cat /etc/crt-users 2>/dev/null); do
+while IFS= read -r entry; do
     uid=$(id -u "$entry" 2>/dev/null) || { echo "crt-cgroup: unknown user $entry"; continue; }
     gid=$(id -g "$entry" 2>/dev/null) || continue
     cg="/sys/fs/cgroup/user-${uid}"
     mkdir -p "$cg"
-    printf '+memory +cpu\n' >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+    printf '+memory +cpu\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
     chown -R "${uid}:${gid}" "$cg"
     echo "crt-cgroup: delegated cgroup for ${entry} (${uid})"
-done
+done < /etc/crt-users 2>/dev/null || true
 exec sleep infinity
 RUNEOF
     chmod +x "$sv_dir/run"
 
     # Register user in /etc/crt-users (one username per line)
+    if [[ ! "$user" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        echo "Error: invalid username '$user'" >&2
+        return 1
+    fi
     if ! grep -qx "$user" /etc/crt-users 2>/dev/null; then
         echo "$user" >> /etc/crt-users
         echo "crt: added '$user' to /etc/crt-users"
