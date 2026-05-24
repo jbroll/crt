@@ -270,6 +270,9 @@ apply_cgroup() {
         return 0
     fi
 
+    # Record path for cleanup after unshare exits
+    _CRT_CGROUP="$cg"
+
     if [ -n "$memory" ]; then
         local mem_bytes
         mem_bytes=$(parse_memory "$memory" 2>/dev/null) || {
@@ -440,6 +443,7 @@ cmd_run() {
     done
 
     # Apply cgroup limits before exec
+    _CRT_CGROUP=""
     apply_cgroup "$memory" "$cpus"
 
     [ $# -eq 0 ] && set -- /bin/bash -l
@@ -448,7 +452,7 @@ cmd_run() {
     workdir="$(pwd)"
 
     # shellcheck disable=SC2016
-    exec unshare --user --map-root-user --mount --pid --uts --ipc -f \
+    unshare --user --map-root-user --mount --pid --uts --ipc -f \
         /bin/bash -c '
             rootfs=$1; userhome=$2; workdir=$3; nmounts=$4; shift 4
             mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" "$rootfs/tmp" "$rootfs/etc"
@@ -471,6 +475,10 @@ cmd_run() {
             exec chroot "$rootfs" /bin/sh -c \
                 '"'"'cd "$1" 2>/dev/null || cd /; shift; exec "$@"'"'"' -- "$workdir" "$@"
         ' -- "$rootfs" "$HOME" "$workdir" "${#all_mounts[@]}" "${all_mounts[@]}" "$@"
+    local _rc
+    _rc=$?
+    [ -n "${_CRT_CGROUP:-}" ] && rmdir "$_CRT_CGROUP" 2>/dev/null || true
+    exit "$_rc"
 }
 
 cmd_list() {
@@ -586,7 +594,10 @@ cmd_setup() {
             echo "Error: unknown user '$1'" >&2
             exit 1
         }
-        target_gid=$(id -g "$1")
+        target_gid=$(id -g "$1") || {
+            echo "Error: cannot get gid for '$1'" >&2
+            exit 1
+        }
         target_user="$1"
     else
         echo "Error: run as 'sudo crt setup' or 'crt setup <username>'" >&2
