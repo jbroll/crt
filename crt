@@ -594,7 +594,7 @@ cmd_setup() {
             echo "Error: unknown user '$1'" >&2
             exit 1
         }
-        target_gid=$(id -g "$1") || {
+        target_gid=$(id -g "$1" 2>/dev/null) || {
             echo "Error: cannot get gid for '$1'" >&2
             exit 1
         }
