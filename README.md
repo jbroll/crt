@@ -31,6 +31,7 @@ crt run [-v h:c] [-e K=v] [-m SIZE] [-c N] <name> <cmd>  Run command (flags over
 crt list                         List rootfs environments
 crt rm     <name>                Remove rootfs
 crt export <name> <binary>       Create host wrapper script for a binary
+crt setup                        Enable memory/cpu limits (run once with sudo)
 ```
 
 ### `crt run` flags
@@ -43,6 +44,22 @@ Flags add to or override the stored config for a single invocation:
 | `-e KEY=val` | Additional or override env var |
 | `-m SIZE` | Memory limit override (e.g. `256M`) |
 | `-c FLOAT` | CPU limit override (e.g. `1.5`) |
+
+## Setup
+
+Resource limits (`memory`/`cpus`) require a one-time root step to delegate a cgroup to your user. After that they work automatically on every `crt run`.
+
+```sh
+sudo crt setup
+```
+
+This:
+1. Creates `/sys/fs/cgroup/user-$UID/` and delegates memory+cpu control to your user
+2. On runit systems: installs `/etc/sv/crt-cgroup/` (backed by `/etc/crt-users`) so delegation persists across reboots
+
+If `crt setup` hasn't been run, `crt run -m 512M ...` warns and continues without limits.
+
+**Supported init systems:** runit (Void Linux). Other init systems receive manual startup instructions from `crt setup`.
 
 ## Creating environments
 
@@ -185,4 +202,4 @@ This lets the full `cmd_create` and `cmd_run` code paths run without root, names
 
 - No network isolation (host network stack is shared)
 - No private registry authentication
-- Resource limits (`memory`/`cpus`) require cgroup v2 with user delegation; degrade gracefully with a warning if unavailable
+- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup) below)
