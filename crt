@@ -565,6 +565,102 @@ EOF
     echo "Exported: $wrapper -> $name:$bin_path"
 }
 
+cmd_setup() {
+    # Must run as root (directly or via sudo)
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: 'crt setup' must run as root." >&2
+        echo "  Try: sudo crt setup" >&2
+        exit 1
+    fi
+
+    # Determine the target user
+    local target_uid target_gid target_user
+    if [ -n "${SUDO_UID:-}" ]; then
+        # Invoked via sudo — set up for the invoking user
+        target_uid="$SUDO_UID"
+        target_gid="${SUDO_GID:-$SUDO_UID}"
+        target_user="${SUDO_USER:-uid-$SUDO_UID}"
+    elif [ -n "${1:-}" ]; then
+        # Username passed explicitly (e.g. root running: crt setup alice)
+        target_uid=$(id -u "$1" 2>/dev/null) || {
+            echo "Error: unknown user '$1'" >&2
+            exit 1
+        }
+        target_gid=$(id -g "$1")
+        target_user="$1"
+    else
+        echo "Error: run as 'sudo crt setup' or 'crt setup <username>'" >&2
+        exit 1
+    fi
+
+    # 1. Immediate cgroup delegation
+    printf '+memory +cpu\n' >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || {
+        echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
+    }
+    local cg="/sys/fs/cgroup/user-${target_uid}"
+    mkdir -p "$cg"
+    chown -R "${target_uid}:${target_gid}" "$cg"
+    echo "crt: cgroup delegation active for $target_user (uid=$target_uid)"
+
+    # 2. Install boot-time persistence
+    local init_system="unknown"
+    { [ -d /run/runit ] || [ -f /etc/runit/1 ]; } && init_system="runit"
+
+    case "$init_system" in
+        runit)
+            _setup_runit "$target_uid" "$target_gid" "$target_user"
+            ;;
+        *)
+            echo "Warning: unrecognised init system — limits active now but won't survive reboot" >&2
+            echo "  Add to your system startup (as root):" >&2
+            printf '    printf '"'"'+memory +cpu\\n'"'"' >> /sys/fs/cgroup/cgroup.subtree_control\n' >&2
+            echo "    mkdir -p /sys/fs/cgroup/user-${target_uid}" >&2
+            echo "    chown -R ${target_uid}:${target_gid} /sys/fs/cgroup/user-${target_uid}" >&2
+            ;;
+    esac
+}
+
+_setup_runit() {
+    local uid="$1"
+    local gid="$2"
+    local user="$3"
+
+    local sv_dir="/etc/sv/crt-cgroup"
+    local service_dir="/var/service"
+
+    mkdir -p "$sv_dir"
+    cat > "$sv_dir/run" << 'RUNEOF'
+#!/bin/sh
+exec 2>&1
+for entry in $(cat /etc/crt-users 2>/dev/null); do
+    uid=$(id -u "$entry" 2>/dev/null) || { echo "crt-cgroup: unknown user $entry"; continue; }
+    gid=$(id -g "$entry" 2>/dev/null) || continue
+    cg="/sys/fs/cgroup/user-${uid}"
+    mkdir -p "$cg"
+    printf '+memory +cpu\n' >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+    chown -R "${uid}:${gid}" "$cg"
+    echo "crt-cgroup: delegated cgroup for ${entry} (${uid})"
+done
+exec sleep infinity
+RUNEOF
+    chmod +x "$sv_dir/run"
+
+    # Register user in /etc/crt-users (one username per line)
+    if ! grep -qx "$user" /etc/crt-users 2>/dev/null; then
+        echo "$user" >> /etc/crt-users
+        echo "crt: added '$user' to /etc/crt-users"
+    fi
+
+    # Enable service (symlink into active service directory)
+    if [ ! -L "$service_dir/crt-cgroup" ]; then
+        ln -s "$sv_dir" "$service_dir/crt-cgroup"
+        echo "crt: runit service installed at $service_dir/crt-cgroup"
+    else
+        sv restart crt-cgroup 2>/dev/null || true
+        echo "crt: runit service restarted"
+    fi
+}
+
 cmd_help() {
     cat << 'EOF'
 crt - minimal chroot manager
@@ -577,6 +673,7 @@ Usage:
   crt list                        List chroots
   crt rm <name>                   Remove chroot
   crt export <name> <binary>      Create host wrapper for binary
+  crt setup                       Delegate cgroup to your user (run with sudo)
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)
@@ -606,6 +703,7 @@ case "${1:-}" in
     list|ls) cmd_list ;;
     rm|remove) shift; cmd_rm "$@" ;;
     export) shift; cmd_export "$@" ;;
+    setup)  shift; cmd_setup "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
         cmd_help

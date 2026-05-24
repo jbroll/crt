@@ -420,4 +420,19 @@ Test "export missing chroot returns error"
 err=$("$CRT" export noexist mytool 2>&1 || true)
 if echo "$err" | grep -q "not found"; then Pass; else Fail; fi
 
+# ── cmd_setup ─────────────────────────────────────────────────────────────────
+echo "# cmd_setup"
+
+Test "setup: requires root"
+err=$("$CRT" setup 2>&1 || true)
+if echo "$err" | grep -q "must run as root"; then Pass; else Fail; fi
+
+Test "setup: without sudo uid requires username arg"
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    err=$(sudo env -u SUDO_UID "$CRT" setup 2>&1 || true)
+    if echo "$err" | grep -q "sudo crt setup\|crt setup <username>"; then Pass; else Fail; fi
+else
+    Pass  # skip: no passwordless sudo available
+fi
+
 TestDone
