@@ -163,6 +163,17 @@ oci_unpack() {
     done
 }
 
+parse_memory() {
+    local val="$1"
+    local num="${val%[GgMmKk]}"
+    case "${val: -1}" in
+        G|g) echo $(( num * 1024 * 1024 * 1024 )) ;;
+        M|m) echo $(( num * 1024 * 1024 )) ;;
+        K|k) echo $(( num * 1024 )) ;;
+        *)   echo "$val" ;;
+    esac
+}
+
 _create_xbps() {
     local rootfs="$1"
     local repo="${VOID_REPO:-https://repo-default.voidlinux.org/current}"
