@@ -151,15 +151,17 @@ oci_unpack() {
                 return 1
             }
         else
+            local blob_tmp="${blob}.tmp"
             (set -o pipefail; curl -fsSL \
                 -H "Authorization: Bearer $token" \
                 "${api_base}/blobs/${digest}" \
-                | tee "$blob" \
+                | tee "$blob_tmp" \
                 | tar -xzf - -C "$rootfs" 2>/dev/null) || {
-                rm -f "$blob"
+                rm -f "$blob_tmp"
                 echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
                 return 1
             }
+            mv "$blob_tmp" "$blob"
         fi
 
         # Process whiteout files for this layer before moving to the next
@@ -260,15 +262,17 @@ apply_cgroup() {
             echo "Warning: invalid memory value '$memory', skipping" >&2
             mem_bytes=""
         }
-        [ -n "$mem_bytes" ] && echo "$mem_bytes" > "$cg/memory.max" 2>/dev/null || \
-            echo "Warning: failed to set memory limit to $memory" >&2
+        if [ -n "$mem_bytes" ]; then
+            echo "$mem_bytes" > "$cg/memory.max" \
+                || echo "Warning: failed to set memory limit to $memory" >&2
+        fi
     fi
 
     if [ -n "$cpus" ]; then
         local quota
         quota=$(awk "BEGIN { printf \"%d\", $cpus * 100000 }")
-        echo "$quota 100000" > "$cg/cpu.max" 2>/dev/null || \
-            echo "Warning: failed to set CPU limit to $cpus" >&2
+        echo "$quota 100000" > "$cg/cpu.max" \
+            || echo "Warning: failed to set CPU limit to $cpus" >&2
     fi
 }
 
