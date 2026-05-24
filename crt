@@ -97,10 +97,12 @@ oci_manifest() {
         return 1
     }
 
-    # If it's an image index (multi-arch), select the right platform
-    local media_type
-    media_type=$(echo "$manifest" | jq -r '.mediaType // ""')
-    if echo "$media_type" | grep -q "index\|list"; then
+    # Detect image index: check mediaType field OR presence of .manifests array
+    local is_index
+    is_index=$(echo "$manifest" | jq -r '
+        if (.mediaType // "" | test("index|list")) or (.manifests != null) then "yes" else "" end
+    ')
+    if [ "$is_index" = "yes" ]; then
         local digest
         digest=$(echo "$manifest" | jq -r \
             --arg arch "$arch" \
