@@ -202,4 +202,4 @@ This lets the full `cmd_create` and `cmd_run` code paths run without root, names
 
 - No network isolation (host network stack is shared)
 - No private registry authentication
-- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup) below)
+- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup))
