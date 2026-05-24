@@ -196,6 +196,12 @@ read_config() {
     while read -r key val; do
         case "$key" in
             '#'*|'') continue ;;
+        esac
+        if [ -z "$val" ]; then
+            echo "Warning: config directive '$key' has no value, skipping" >&2
+            continue
+        fi
+        case "$key" in
             image)   config_image="$val" ;;
             mount)   config_mounts+=("$val") ;;
             env)     config_envs+=("$val") ;;
