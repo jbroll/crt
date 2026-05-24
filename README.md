@@ -42,8 +42,8 @@ Flags add to or override the stored config for a single invocation:
 |---|---|
 | `-v /host:/container` | Additional bind mount |
 | `-e KEY=val` | Additional or override env var |
-| `-m SIZE` | Memory limit override (e.g. `256M`) — requires `sudo crt setup` |
-| `-c FLOAT` | CPU limit override (e.g. `1.5`) — requires `sudo crt setup` |
+| `-m SIZE` | Memory limit override (e.g. `256M`) |
+| `-c FLOAT` | CPU limit override (e.g. `1.5`) |
 
 ## Setup
 
@@ -123,8 +123,8 @@ The file is copied verbatim to `$CRT_HOME/myenv/config` and used as the source o
 | `image` | no | OCI image reference, or `void` for xbps bootstrap |
 | `mount` | yes | `hostpath:containerpath` bind mount |
 | `env` | yes | `KEY=val` environment variable |
-| `memory` | no | Memory limit: `512M`, `2G`, etc. — requires `sudo crt setup` |
-| `cpus` | no | CPU limit as a float: `2`, `0.5` — requires `sudo crt setup` |
+| `memory` | no | Memory limit: `512M`, `2G`, etc. |
+| `cpus` | no | CPU limit as a float: `2`, `0.5` |
 
 ## Exporting binaries
 
