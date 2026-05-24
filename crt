@@ -70,6 +70,59 @@ oci_token() {
     echo "$token"
 }
 
+oci_manifest() {
+    local registry="$1"
+    local repo="$2"
+    local tag="$3"
+    local token="$4"
+    local api_base="https://${registry}/v2/${repo}"
+    local arch
+
+    case "$(uname -m)" in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l)  arch="arm" ;;
+        *)       arch="$(uname -m)" ;;
+    esac
+
+    local manifest
+    manifest=$(curl -fsSL \
+        -H "Authorization: Bearer $token" \
+        -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+        -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+        -H "Accept: application/vnd.oci.image.index.v1+json" \
+        "${api_base}/manifests/${tag}") || {
+        echo "Error: failed to fetch manifest for ${registry}/${repo}:${tag}" >&2
+        return 1
+    }
+
+    # If it's an image index (multi-arch), select the right platform
+    local media_type
+    media_type=$(echo "$manifest" | jq -r '.mediaType // ""')
+    if echo "$media_type" | grep -q "index\|list"; then
+        local digest
+        digest=$(echo "$manifest" | jq -r \
+            --arg arch "$arch" \
+            '.manifests[] | select(.platform.architecture == $arch) | .digest' \
+            | head -1)
+        if [ -z "$digest" ]; then
+            echo "Error: no manifest found for arch $arch in ${registry}/${repo}:${tag}" >&2
+            return 1
+        fi
+        manifest=$(curl -fsSL \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            "${api_base}/manifests/${digest}") || {
+            echo "Error: failed to fetch platform manifest ${digest}" >&2
+            return 1
+        }
+    fi
+
+    echo "$manifest"
+}
+
 cmd_create() {
     local name="$1"
     local image="${2:-docker.io/library/ubuntu:22.04}"
