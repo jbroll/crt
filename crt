@@ -272,7 +272,7 @@ apply_cgroup() {
 
     if [ -n "$memory" ]; then
         local mem_bytes
-        mem_bytes=$(parse_memory "$memory") || {
+        mem_bytes=$(parse_memory "$memory" 2>/dev/null) || {
             echo "Warning: invalid memory value '$memory', skipping" >&2
             mem_bytes=""
         }
@@ -284,7 +284,7 @@ apply_cgroup() {
 
     if [ -n "$cpus" ]; then
         local quota
-        quota=$(awk "BEGIN { printf \"%d\", $cpus * 100000 }")
+        quota=$(awk -v cpus="$cpus" 'BEGIN { printf "%d", cpus * 100000 }')
         echo "$quota 100000" > "$cg/cpu.max" \
             || echo "Warning: failed to set CPU limit to $cpus" >&2
     fi
