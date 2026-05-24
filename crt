@@ -462,8 +462,9 @@ cmd_list() {
     echo "NAME            SIZE      PATH"
     for dir in "$CRT_HOME"/*/; do
         [ -d "$dir" ] || continue
-        local name=$(basename "$dir")
-        local size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+        local name size
+        name=$(basename "$dir")
+        size=$(du -sh "$dir" 2>/dev/null | cut -f1)
         printf "%-15s %-9s %s\n" "$name" "$size" "$dir"
     done
 }
@@ -531,7 +532,8 @@ cmd_export() {
     mkdir -p "$CRT_BIN"
 
     local wrapper="$CRT_BIN/$wrapper_name"
-    local self_path="$(realpath "$0")"
+    local self_path
+    self_path="$(realpath "$0")"
 
     cat > "$wrapper" << EOF
 #!/bin/bash
