@@ -18,17 +18,19 @@ parse_image_ref() {
     local input="$1"
     local registry repo tag
 
-    # Extract tag
-    if [[ "$input" == *:* ]] && [[ "${input##*:}" != */* ]]; then
-        tag="${input##*:}"
-        input="${input%:*}"
+    # Extract tag: only if colon appears in the last path segment (after last slash)
+    local last_seg="${input##*/}"
+    if [[ "$last_seg" == *:* ]]; then
+        tag="${last_seg##*:}"
+        input="${input%:"${tag}"}"
     else
         tag="latest"
     fi
 
-    # Extract registry (hostname with dot or colon means it's a registry prefix)
-    if [[ "$input" == *.io/* || "$input" == *.com/* || "$input" == *:*/* ]]; then
-        registry="${input%%/*}"
+    # Extract registry: first component is a hostname if it contains '.' or ':'
+    local first="${input%%/*}"
+    if [[ "$input" == */* ]] && [[ "$first" == *.* || "$first" == *:* ]]; then
+        registry="$first"
         repo="${input#*/}"
     elif [[ "$input" == */* ]]; then
         registry="registry-1.docker.io"
