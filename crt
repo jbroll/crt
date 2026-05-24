@@ -256,25 +256,29 @@ cmd_run() {
         exit 1
     fi
 
-    # Build podman command
-    # NOTE: --rootfs MUST come last before the command (podman quirk)
-    local -a args=(
-        podman run --rm -i
-        --security-opt label=disable
-        -v "$HOME:$HOME"
-        -v /tmp:/tmp
-        -w "$(pwd)"
-    )
+    [ $# -eq 0 ] && set -- /bin/bash -l
 
-    [ -t 0 ] && args+=(-t)
+    local workdir
+    workdir="$(pwd)"
 
-    args+=(--rootfs "$rootfs")
-
-    if [ $# -eq 0 ]; then
-        exec "${args[@]}" /bin/bash -l
-    else
-        exec "${args[@]}" "$@"
-    fi
+    # Pass rootfs, HOME, workdir as positional args to the unshare bash script
+    # to avoid quoting issues across the process boundary. Single-quoted script
+    # body receives them as $1 $2 $3 and the actual command as remaining args.
+    # shellcheck disable=SC2016
+    exec unshare --user --map-root-user --mount --pid --uts --ipc -f \
+        /bin/bash -c '
+            rootfs=$1; userhome=$2; workdir=$3; shift 3
+            mount -t proc proc "$rootfs/proc"
+            mount -t sysfs sysfs "$rootfs/sys"
+            mount --bind /dev "$rootfs/dev"
+            mount --bind /dev/pts "$rootfs/dev/pts"
+            mount --bind /etc/resolv.conf "$rootfs/etc/resolv.conf"
+            mkdir -p "$rootfs$userhome"
+            mount --bind "$userhome" "$rootfs$userhome"
+            mount --bind /tmp "$rootfs/tmp"
+            exec chroot "$rootfs" /bin/sh -c \
+                "cd \"$workdir\" 2>/dev/null || cd /; exec \"\$@\"" -- "$@"
+        ' -- "$rootfs" "$HOME" "$workdir" "$@"
 }
 
 cmd_list() {
