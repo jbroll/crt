@@ -351,34 +351,68 @@ cmd_enter() {
 }
 
 cmd_run() {
+    OPTIND=1
+    local opt
+    local -a flag_mounts=() flag_envs=()
+    local flag_memory="" flag_cpus=""
+
+    while getopts ':v:e:m:c:' opt; do
+        case "$opt" in
+            v) flag_mounts+=("$OPTARG") ;;
+            e) flag_envs+=("$OPTARG") ;;
+            m) flag_memory="$OPTARG" ;;
+            c) flag_cpus="$OPTARG" ;;
+            :) echo "Error: -$OPTARG requires an argument" >&2; exit 1 ;;
+            ?) echo "Error: unknown option -$OPTARG" >&2; exit 1 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
     local name="$1"
     shift
 
     if [ -z "$name" ]; then
-        echo "Usage: crt run <name> <command> [args...]"
+        echo "Usage: crt run [-v host:container] [-e KEY=val] [-m SIZE] [-c FLOAT] <name> [cmd...]"
         exit 1
     fi
 
     local rootfs="$CRT_HOME/$name"
 
     if [ ! -d "$rootfs/bin" ]; then
-        echo "Error: Chroot '$name' not found"
-        echo "Run: crt create $name"
+        echo "Error: Chroot '$name' not found" >&2
+        echo "Run: crt create $name" >&2
         exit 1
     fi
+
+    # Load stored config
+    local config_image="" config_memory="" config_cpus=""
+    local -a config_mounts=() config_envs=()
+    read_config "$CRT_HOME/$name/config"
+
+    # Merge: config first, flags override/extend
+    local -a all_mounts=("${config_mounts[@]}" "${flag_mounts[@]}")
+    local -a all_envs=("${config_envs[@]}" "${flag_envs[@]}")
+    local memory="${flag_memory:-$config_memory}"
+    local cpus="${flag_cpus:-$config_cpus}"
+
+    # Apply env vars (inherited through exec unshare automatically)
+    local env_spec
+    for env_spec in "${all_envs[@]}"; do
+        export "$env_spec"
+    done
+
+    # Apply cgroup limits before exec
+    apply_cgroup "$memory" "$cpus"
 
     [ $# -eq 0 ] && set -- /bin/bash -l
 
     local workdir
     workdir="$(pwd)"
 
-    # Pass rootfs, HOME, workdir as positional args to the unshare bash script
-    # to avoid quoting issues across the process boundary. Single-quoted script
-    # body receives them as $1 $2 $3 and the actual command as remaining args.
     # shellcheck disable=SC2016
     exec unshare --user --map-root-user --mount --pid --uts --ipc -f \
         /bin/bash -c '
-            rootfs=$1; userhome=$2; workdir=$3; shift 3
+            rootfs=$1; userhome=$2; workdir=$3; nmounts=$4; shift 4
             mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" "$rootfs/tmp" "$rootfs/etc"
             touch "$rootfs/etc/resolv.conf"
             mount -t proc proc "$rootfs/proc"
@@ -389,10 +423,16 @@ cmd_run() {
             mkdir -p "$rootfs$userhome"
             mount --bind "$userhome" "$rootfs$userhome"
             mount --bind /tmp "$rootfs/tmp"
-            # shellcheck disable=SC2145,SC2016
+            i=0
+            while [ "$i" -lt "$nmounts" ]; do
+                spec=$1; shift; i=$((i+1))
+                host="${spec%%:*}"; container="${spec#*:}"
+                mkdir -p "$rootfs$container"
+                mount --bind "$host" "$rootfs$container"
+            done
             exec chroot "$rootfs" /bin/sh -c \
-                'cd "$1" 2>/dev/null || cd /; shift; exec "$@"' -- "$workdir" "$@"
-        ' -- "$rootfs" "$HOME" "$workdir" "$@"
+                '"'"'cd "$1" 2>/dev/null || cd /; shift; exec "$@"'"'"' -- "$workdir" "$@"
+        ' -- "$rootfs" "$HOME" "$workdir" "${#all_mounts[@]}" "${all_mounts[@]}" "$@"
 }
 
 cmd_list() {
