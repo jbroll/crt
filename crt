@@ -137,16 +137,30 @@ oci_unpack() {
     local layers
     layers=$(echo "$manifest" | jq -r '.layers[].digest')
 
+    local cache_dir="$CRT_HOME/.cache/layers"
+    mkdir -p "$cache_dir"
+
     local digest
     for digest in $layers; do
+        local blob="$cache_dir/${digest//:/-}"
         echo "  layer ${digest:7:12}..."
-        (set -o pipefail; curl -fsSL \
-            -H "Authorization: Bearer $token" \
-            "${api_base}/blobs/${digest}" \
-            | tar -xzf - -C "$rootfs" 2>/dev/null) || {
-            echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
-            return 1
-        }
+
+        if [ -f "$blob" ]; then
+            tar -xzf "$blob" -C "$rootfs" 2>/dev/null || {
+                echo "Error: failed to unpack cached layer ${digest:7:12}" >&2
+                return 1
+            }
+        else
+            (set -o pipefail; curl -fsSL \
+                -H "Authorization: Bearer $token" \
+                "${api_base}/blobs/${digest}" \
+                | tee "$blob" \
+                | tar -xzf - -C "$rootfs" 2>/dev/null) || {
+                rm -f "$blob"
+                echo "Error: failed to download or unpack layer ${digest:7:12}" >&2
+                return 1
+            }
+        fi
 
         # Process whiteout files for this layer before moving to the next
         while read -r wh_file; do
