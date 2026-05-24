@@ -182,6 +182,29 @@ parse_memory() {
     esac
 }
 
+read_config() {
+    local config_file="$1"
+    config_image=""
+    config_mounts=()
+    config_envs=()
+    config_memory=""
+    config_cpus=""
+
+    [ -f "$config_file" ] || return 0
+
+    local key val
+    while read -r key val; do
+        case "$key" in
+            '#'*|'') continue ;;
+            image)   config_image="$val" ;;
+            mount)   config_mounts+=("$val") ;;
+            env)     config_envs+=("$val") ;;
+            memory)  config_memory="$val" ;;
+            cpus)    config_cpus="$val" ;;
+        esac
+    done < "$config_file"
+}
+
 _create_xbps() {
     local rootfs="$1"
     local repo="${VOID_REPO:-https://repo-default.voidlinux.org/current}"
