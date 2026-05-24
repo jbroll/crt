@@ -211,6 +211,53 @@ read_config() {
     done < "$config_file"
 }
 
+write_config() {
+    local config_file="$1"
+    local image="$2"
+    printf 'image %s\n' "$image" > "$config_file"
+}
+
+apply_cgroup() {
+    local memory="$1"
+    local cpus="$2"
+
+    [ -z "$memory" ] && [ -z "$cpus" ] && return 0
+
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "Warning: cgroup v2 not available, resource limits not applied" >&2
+        return 0
+    fi
+
+    local cg="/sys/fs/cgroup/crt-$$"
+    if ! mkdir -p "$cg" 2>/dev/null; then
+        echo "Warning: cannot create cgroup $cg, resource limits not applied" >&2
+        return 0
+    fi
+
+    if ! echo $$ > "$cg/cgroup.procs" 2>/dev/null; then
+        echo "Warning: cannot join cgroup, resource limits not applied" >&2
+        rmdir "$cg" 2>/dev/null
+        return 0
+    fi
+
+    if [ -n "$memory" ]; then
+        local mem_bytes
+        mem_bytes=$(parse_memory "$memory") || {
+            echo "Warning: invalid memory value '$memory', skipping" >&2
+            mem_bytes=""
+        }
+        [ -n "$mem_bytes" ] && echo "$mem_bytes" > "$cg/memory.max" 2>/dev/null || \
+            echo "Warning: failed to set memory limit to $memory" >&2
+    fi
+
+    if [ -n "$cpus" ]; then
+        local quota
+        quota=$(awk "BEGIN { printf \"%d\", $cpus * 100000 }")
+        echo "$quota 100000" > "$cg/cpu.max" 2>/dev/null || \
+            echo "Warning: failed to set CPU limit to $cpus" >&2
+    fi
+}
+
 _create_xbps() {
     local rootfs="$1"
     local repo="${VOID_REPO:-https://repo-default.voidlinux.org/current}"
