@@ -1,0 +1,249 @@
+#!/bin/bash
+# crt - minimal chroot manager using podman
+#
+# Usage:
+#   crt create <name> [image]       # Create rootfs (default: ubuntu:22.04)
+#   crt enter <name>                # Interactive shell
+#   crt run <name> <cmd> [args...]  # Run command
+#   crt list                        # List chroots
+#   crt rm <name>                   # Remove chroot
+#   crt export <name> <binary>      # Create host wrapper for binary
+
+set -e
+
+CRT_HOME="${CRT_HOME:-/home/crt}"
+CRT_BIN="${CRT_BIN:-/home/crt/bin}"
+
+parse_image_ref() {
+    local input="$1"
+    local registry repo tag
+
+    # Extract tag
+    if [[ "$input" == *:* ]] && [[ "${input##*:}" != */* ]]; then
+        tag="${input##*:}"
+        input="${input%:*}"
+    else
+        tag="latest"
+    fi
+
+    # Extract registry (hostname with dot or colon means it's a registry prefix)
+    if [[ "$input" == *.io/* || "$input" == *.com/* || "$input" == *:*/* ]]; then
+        registry="${input%%/*}"
+        repo="${input#*/}"
+    elif [[ "$input" == */* ]]; then
+        registry="registry-1.docker.io"
+        repo="$input"
+    else
+        registry="registry-1.docker.io"
+        repo="library/$input"
+    fi
+
+    echo "$registry" "$repo" "$tag"
+}
+
+cmd_create() {
+    local name="$1"
+    local image="${2:-docker.io/library/ubuntu:22.04}"
+
+    if [ -z "$name" ]; then
+        echo "Usage: crt create <name> [image]"
+        echo "  image defaults to ubuntu:22.04"
+        exit 1
+    fi
+
+    local rootfs="$CRT_HOME/$name"
+
+    if [ -d "$rootfs" ] && [ -f "$rootfs/bin/sh" ]; then
+        echo "Chroot '$name' already exists at $rootfs"
+        exit 1
+    fi
+
+    echo "Creating chroot '$name' from $image..."
+
+    podman pull "$image"
+
+    local cid=$(podman create "$image" /bin/true)
+    mkdir -p "$rootfs"
+    podman export "$cid" | tar -xf - -C "$rootfs"
+    podman rm "$cid" > /dev/null
+
+    echo "Created: $rootfs ($(du -sh "$rootfs" 2>/dev/null | cut -f1))"
+}
+
+cmd_enter() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        echo "Usage: crt enter <name>"
+        exit 1
+    fi
+
+    cmd_run "$name" bash -l
+}
+
+cmd_run() {
+    local name="$1"
+    shift
+
+    if [ -z "$name" ]; then
+        echo "Usage: crt run <name> <command> [args...]"
+        exit 1
+    fi
+
+    local rootfs="$CRT_HOME/$name"
+
+    if [ ! -d "$rootfs/bin" ]; then
+        echo "Error: Chroot '$name' not found"
+        echo "Run: crt create $name"
+        exit 1
+    fi
+
+    # Build podman command
+    # NOTE: --rootfs MUST come last before the command (podman quirk)
+    local -a args=(
+        podman run --rm -i
+        --security-opt label=disable
+        -v "$HOME:$HOME"
+        -v /tmp:/tmp
+        -w "$(pwd)"
+    )
+
+    [ -t 0 ] && args+=(-t)
+
+    args+=(--rootfs "$rootfs")
+
+    if [ $# -eq 0 ]; then
+        exec "${args[@]}" /bin/bash -l
+    else
+        exec "${args[@]}" "$@"
+    fi
+}
+
+cmd_list() {
+    if [ ! -d "$CRT_HOME" ]; then
+        echo "No chroots found in $CRT_HOME"
+        exit 0
+    fi
+
+    echo "NAME            SIZE      PATH"
+    for dir in "$CRT_HOME"/*/; do
+        [ -d "$dir" ] || continue
+        local name=$(basename "$dir")
+        local size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+        printf "%-15s %-9s %s\n" "$name" "$size" "$dir"
+    done
+}
+
+cmd_rm() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        echo "Usage: crt rm <name>"
+        exit 1
+    fi
+
+    local rootfs="$CRT_HOME/$name"
+
+    if [ ! -d "$rootfs" ]; then
+        echo "Error: Chroot '$name' not found"
+        exit 1
+    fi
+
+    echo "Removing $rootfs..."
+    rm -rf "$rootfs"
+    echo "Removed chroot '$name'"
+}
+
+cmd_export() {
+    local name="$1"
+    local binary="$2"
+    local wrapper_name="${3:-$(basename "$binary")}"
+
+    if [ -z "$name" ] || [ -z "$binary" ]; then
+        echo "Usage: crt export <name> <binary> [wrapper-name]"
+        echo ""
+        echo "Examples:"
+        echo "  crt export ubuntu perl"
+        echo "  crt export ubuntu /usr/bin/python3 python"
+        exit 1
+    fi
+
+    local rootfs="$CRT_HOME/$name"
+
+    if [ ! -d "$rootfs/bin" ]; then
+        echo "Error: Chroot '$name' not found"
+        exit 1
+    fi
+
+    # Find the binary in the chroot
+    local bin_path=""
+    if [[ "$binary" == /* ]]; then
+        bin_path="$binary"
+    else
+        # Search common paths
+        for p in /usr/bin /bin /usr/local/bin /usr/sbin /sbin; do
+            if [ -f "$rootfs$p/$binary" ]; then
+                bin_path="$p/$binary"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$bin_path" ] || [ ! -f "$rootfs$bin_path" ]; then
+        echo "Error: Binary '$binary' not found in chroot '$name'"
+        exit 1
+    fi
+
+    mkdir -p "$CRT_BIN"
+
+    local wrapper="$CRT_BIN/$wrapper_name"
+    local self_path="$(realpath "$0")"
+
+    cat > "$wrapper" << EOF
+#!/bin/bash
+# crt wrapper for $bin_path from $name
+exec "$self_path" run "$name" "$bin_path" "\$@"
+EOF
+
+    chmod +x "$wrapper"
+    echo "Exported: $wrapper -> $name:$bin_path"
+}
+
+cmd_help() {
+    cat << 'EOF'
+crt - minimal chroot manager using podman
+
+Usage:
+  crt create <name> [image]       Create rootfs (default: ubuntu:22.04)
+  crt enter <name>                Interactive shell
+  crt run <name> <cmd> [args...]  Run command
+  crt list                        List chroots
+  crt rm <name>                   Remove chroot
+  crt export <name> <binary>      Create host wrapper for binary
+
+Environment:
+  CRT_HOME   Where chroots are stored (default: /home/crt)
+  CRT_BIN    Where wrappers are created (default: /home/crt/bin)
+
+Examples:
+  crt create ubuntu
+  crt run ubuntu apt install -y perl python3
+  crt export ubuntu perl
+  crt enter ubuntu
+EOF
+}
+
+# Main dispatch
+case "${1:-}" in
+    create) shift; cmd_create "$@" ;;
+    enter)  shift; cmd_enter "$@" ;;
+    run)    shift; cmd_run "$@" ;;
+    list|ls) cmd_list ;;
+    rm|remove) shift; cmd_rm "$@" ;;
+    export) shift; cmd_export "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        cmd_help
+        exit 1
+        ;;
+esac
