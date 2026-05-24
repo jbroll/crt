@@ -165,12 +165,20 @@ oci_unpack() {
 
 parse_memory() {
     local val="$1"
+    if [ -z "$val" ]; then
+        echo "Error: parse_memory requires a value" >&2
+        return 1
+    fi
     local num="${val%[GgMmKk]}"
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid memory value '$val'" >&2
+        return 1
+    fi
     case "${val: -1}" in
         G|g) echo $(( num * 1024 * 1024 * 1024 )) ;;
         M|m) echo $(( num * 1024 * 1024 )) ;;
         K|k) echo $(( num * 1024 )) ;;
-        *)   echo "$val" ;;
+        *)   echo "$num" ;;
     esac
 }
 
