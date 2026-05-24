@@ -216,6 +216,7 @@ cmd_create() {
     fi
 
     mkdir -p "$rootfs"
+    trap 'rm -rf "$rootfs"' ERR
 
     if [ -z "$image" ]; then
         _create_xbps "$rootfs"
@@ -223,6 +224,7 @@ cmd_create() {
         _create_oci "$image" "$rootfs"
     fi
 
+    trap - ERR
     echo "Created: $rootfs ($(du -sh "$rootfs" 2>/dev/null | cut -f1))"
 }
 
