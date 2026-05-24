@@ -12,7 +12,9 @@ export PATH="$MOCKS:$PATH"
 # Per-test temp home; cleaned on exit
 CRT_HOME=$(mktemp -d)
 export CRT_HOME
-trap 'rm -rf "$CRT_HOME"' EXIT
+CRT_BIN=$(mktemp -d)
+export CRT_BIN
+trap 'rm -rf "$CRT_HOME" "$CRT_BIN"' EXIT
 
 # Helper: extract a pure function from crt and run it in a subshell.
 # Works for functions whose body contains no nested { } blocks (case/while/if are fine).
@@ -61,7 +63,7 @@ if run_fn parse_memory abc 2>/dev/null; then Fail; else Pass; fi
 echo "# read_config"
 
 CONF=$(mktemp)
-trap 'rm -f "$CONF"; rm -rf "$CRT_HOME"' EXIT
+trap 'rm -f "$CONF"; rm -rf "$CRT_HOME" "$CRT_BIN"' EXIT
 cat > "$CONF" << 'EOF'
 # example config
 image  ubuntu:22.04
@@ -139,12 +141,13 @@ echo \"\$config_image\"
 
 Test "read_config: bare key warns to stderr"
 printf 'image\n' > "$CONF"
-bash -c "
+warn=$(bash -c "
 $(awk '/^read_config\(\)/,/^\}/' "$CRT")
 config_image='' config_memory='' config_cpus=''
 config_mounts=() config_envs=()
-read_config '$CONF' 2>/dev/null
-" && Pass || Fail
+read_config '$CONF'
+" 2>&1 >/dev/null)
+if echo "$warn" | grep -q "Warning"; then Pass; else Fail; fi
 
 # ── write_config ─────────────────────────────────────────────────────────────
 echo "# write_config"
@@ -161,6 +164,41 @@ echo "old content" > "$out"
 run_fn write_config "$out" "alpine:3.19"
 CompareArgs "$(cat "$out")" "image alpine:3.19"
 rm -f "$out"
+
+# ── parse_image_ref ───────────────────────────────────────────────────────────
+echo "# parse_image_ref"
+
+Test "bare name: docker hub, library prefix, latest tag"
+CompareArgs "$(run_fn parse_image_ref ubuntu)" \
+    "registry-1.docker.io library/ubuntu latest"
+
+Test "bare name with tag"
+CompareArgs "$(run_fn parse_image_ref ubuntu:22.04)" \
+    "registry-1.docker.io library/ubuntu 22.04"
+
+Test "user/repo: docker hub, no library prefix"
+CompareArgs "$(run_fn parse_image_ref user/repo)" \
+    "registry-1.docker.io user/repo latest"
+
+Test "user/repo with tag"
+CompareArgs "$(run_fn parse_image_ref user/repo:mytag)" \
+    "registry-1.docker.io user/repo mytag"
+
+Test "ghcr.io registry detected by dot"
+CompareArgs "$(run_fn parse_image_ref ghcr.io/user/repo:v1)" \
+    "ghcr.io user/repo v1"
+
+Test "quay.io multi-segment repo"
+CompareArgs "$(run_fn parse_image_ref quay.io/org/service:v2.1)" \
+    "quay.io org/service v2.1"
+
+Test "registry with port detected by colon in first segment"
+CompareArgs "$(run_fn parse_image_ref localhost:5000/myimage:v1)" \
+    "localhost:5000 myimage v1"
+
+Test "no tag defaults to latest"
+CompareArgs "$(run_fn parse_image_ref alpine)" \
+    "registry-1.docker.io library/alpine latest"
 
 # ── cmd_create ───────────────────────────────────────────────────────────────
 echo "# cmd_create"
@@ -346,5 +384,36 @@ esac
 MOCKEOF
 chmod +x "$MOCKS/curl"
 CompareArgs "$blob_fetches" "0"
+
+# ── cmd_export ────────────────────────────────────────────────────────────────
+echo "# cmd_export"
+
+export_env="exportenv"
+make_rootfs "$export_env"
+mkdir -p "$CRT_HOME/$export_env/usr/bin"
+printf '#!/bin/sh\necho hello\n' > "$CRT_HOME/$export_env/usr/bin/mytool"
+chmod +x "$CRT_HOME/$export_env/usr/bin/mytool"
+
+Test "export creates wrapper script"
+"$CRT" export "$export_env" mytool 2>/dev/null
+if [ -f "$CRT_BIN/mytool" ]; then Pass; else Fail; fi
+
+Test "export wrapper is executable"
+if [ -x "$CRT_BIN/mytool" ]; then Pass; else Fail; fi
+
+Test "export wrapper contains correct crt run invocation"
+if grep -q "run.*$export_env.*mytool" "$CRT_BIN/mytool"; then Pass; else Fail; fi
+
+Test "export with custom wrapper name"
+"$CRT" export "$export_env" mytool myalias 2>/dev/null
+if [ -f "$CRT_BIN/myalias" ]; then Pass; else Fail; fi
+
+Test "export missing binary returns error"
+err=$("$CRT" export "$export_env" notabinary 2>&1 || true)
+if echo "$err" | grep -q "not found"; then Pass; else Fail; fi
+
+Test "export missing chroot returns error"
+err=$("$CRT" export noexist mytool 2>&1 || true)
+if echo "$err" | grep -q "not found"; then Pass; else Fail; fi
 
 TestDone
