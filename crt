@@ -295,18 +295,19 @@ _create_oci() {
 
 cmd_create() {
     local name="$1"
-    local image="${2:-}"
+    local arg="${2:-}"
 
     if [ -z "$name" ]; then
-        echo "Usage: crt create <name> [image]"
-        echo "  no image: bootstrap Void Linux via xbps"
-        echo "  image:    pull from OCI registry (e.g. ubuntu:22.04, ghcr.io/user/img)"
+        echo "Usage: crt create <name> [image|config-file]"
+        echo "  no second arg:   bootstrap Void Linux via xbps"
+        echo "  image reference: pull from OCI registry (e.g. ubuntu:22.04)"
+        echo "  config file:     read directives from file (image, mount, env, memory, cpus)"
         exit 1
     fi
 
     local rootfs="$CRT_HOME/$name"
 
-    if [ -d "$rootfs" ] && [ -f "$rootfs/bin/sh" ]; then
+    if [ -d "$rootfs" ]; then
         echo "Chroot '$name' already exists at $rootfs"
         exit 1
     fi
@@ -314,10 +315,24 @@ cmd_create() {
     mkdir -p "$rootfs"
     trap 'rm -rf "$rootfs"' ERR
 
-    if [ -z "$image" ]; then
+    local stored_config="$CRT_HOME/$name/config"
+
+    if [ -z "$arg" ]; then
         _create_xbps "$rootfs"
+        write_config "$stored_config" "void"
+    elif [ -f "$arg" ]; then
+        local config_image="" config_memory="" config_cpus=""
+        local -a config_mounts=() config_envs=()
+        read_config "$arg"
+        if [ -z "$config_image" ] || [ "$config_image" = "void" ]; then
+            _create_xbps "$rootfs"
+        else
+            _create_oci "$config_image" "$rootfs"
+        fi
+        cp "$arg" "$stored_config"
     else
-        _create_oci "$image" "$rootfs"
+        _create_oci "$arg" "$rootfs"
+        write_config "$stored_config" "$arg"
     fi
 
     trap - ERR
