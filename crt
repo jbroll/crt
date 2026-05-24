@@ -276,8 +276,9 @@ cmd_run() {
             mkdir -p "$rootfs$userhome"
             mount --bind "$userhome" "$rootfs$userhome"
             mount --bind /tmp "$rootfs/tmp"
+            # shellcheck disable=SC2145,SC2016
             exec chroot "$rootfs" /bin/sh -c \
-                "cd \"$workdir\" 2>/dev/null || cd /; exec \"\$@\"" -- "$@"
+                'cd "$1" 2>/dev/null || cd /; shift; exec "$@"' -- "$workdir" "$@"
         ' -- "$rootfs" "$HOME" "$workdir" "$@"
 }
 
