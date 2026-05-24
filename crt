@@ -1,10 +1,11 @@
 #!/bin/bash
-# crt - minimal chroot manager using podman
+# crt - minimal chroot manager
 #
 # Usage:
-#   crt create <name> [image]       # Create rootfs (default: ubuntu:22.04)
+#   crt create <name>               # Bootstrap Void Linux rootfs via xbps
+#   crt create <name> [image]       # Pull rootfs from OCI registry
 #   crt enter <name>                # Interactive shell
-#   crt run <name> <cmd> [args...]  # Run command
+#   crt run <name> <cmd> [args...]  # Run command (isolated via unshare+chroot)
 #   crt list                        # List chroots
 #   crt rm <name>                   # Remove chroot
 #   crt export <name> <binary>      # Create host wrapper for binary
@@ -374,22 +375,31 @@ EOF
 
 cmd_help() {
     cat << 'EOF'
-crt - minimal chroot manager using podman
+crt - minimal chroot manager
 
 Usage:
-  crt create <name> [image]       Create rootfs (default: ubuntu:22.04)
+  crt create <name>               Bootstrap Void Linux rootfs (xbps)
+  crt create <name> [image]       Pull rootfs from OCI registry
   crt enter <name>                Interactive shell
-  crt run <name> <cmd> [args...]  Run command
+  crt run <name> <cmd> [args...]  Run command in isolated environment
   crt list                        List chroots
   crt rm <name>                   Remove chroot
   crt export <name> <binary>      Create host wrapper for binary
 
 Environment:
-  CRT_HOME   Where chroots are stored (default: /home/crt)
-  CRT_BIN    Where wrappers are created (default: /home/crt/bin)
+  CRT_HOME    Where chroots are stored (default: /home/crt)
+  CRT_BIN     Where wrappers are created (default: /home/crt/bin)
+  VOID_REPO   Void Linux package repo (default: https://repo-default.voidlinux.org/current)
+
+Runtime deps:
+  xbps-install  required for: crt create <name>
+  curl jq tar   required for: crt create <name> <image>
+  unshare chroot  required for: crt run / crt enter
 
 Examples:
-  crt create ubuntu
+  crt create void-env
+  crt create ubuntu ubuntu:22.04
+  crt create alpine ghcr.io/library/alpine:3.19
   crt run ubuntu apt install -y perl python3
   crt export ubuntu perl
   crt enter ubuntu
