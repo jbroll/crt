@@ -46,24 +46,28 @@ parse_image_ref() {
 oci_token() {
     local registry="$1"
     local repo="$2"
-    local url
+    local url token
 
     case "$registry" in
         registry-1.docker.io)
-            url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull"
-            ;;
+            url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" ;;
         ghcr.io)
-            url="https://ghcr.io/token?scope=repository:${repo}:pull"
-            ;;
+            url="https://ghcr.io/token?scope=repository:${repo}:pull" ;;
         quay.io)
-            url="https://quay.io/v2/auth?service=quay.io&scope=repository:${repo}:pull"
-            ;;
+            url="https://quay.io/v2/auth?service=quay.io&scope=repository:${repo}:pull" ;;
         *)
-            url="https://${registry}/v2/auth?scope=repository:${repo}:pull"
-            ;;
+            url="https://${registry}/v2/auth?scope=repository:${repo}:pull" ;;
     esac
 
-    curl -fsSL "$url" | jq -r '.token // .access_token'
+    token=$(curl -fsSL "$url" | jq -r '.token // .access_token') || {
+        echo "Error: failed to fetch OCI token from $registry" >&2
+        return 1
+    }
+    if [[ -z "$token" || "$token" == "null" ]]; then
+        echo "Error: no token returned from $registry for $repo" >&2
+        return 1
+    fi
+    echo "$token"
 }
 
 cmd_create() {
