@@ -27,11 +27,22 @@ chmod +x /usr/local/bin/crt
 crt create <name>                Bootstrap Void Linux rootfs (xbps)
 crt create <name> <image>        Pull rootfs from OCI registry
 crt enter  <name>                Interactive shell
-crt run    <name> <cmd> [args…]  Run command in isolated environment
+crt run [-v h:c] [-e K=v] [-m SIZE] [-c N] <name> <cmd>  Run command (flags override config)
 crt list                         List rootfs environments
 crt rm     <name>                Remove rootfs
 crt export <name> <binary>       Create host wrapper script for a binary
 ```
+
+### `crt run` flags
+
+Flags add to or override the stored config for a single invocation:
+
+| Flag | Description |
+|---|---|
+| `-v /host:/container` | Additional bind mount |
+| `-e KEY=val` | Additional or override env var |
+| `-m SIZE` | Memory limit override (e.g. `256M`) |
+| `-c FLOAT` | CPU limit override (e.g. `1.5`) |
 
 ## Creating environments
 
@@ -67,6 +78,36 @@ crt enter ubuntu
 cd /home/john/project
 crt run ubuntu make install    # runs in /home/john/project inside the container
 ```
+
+## Config files
+
+Each environment stores its config at `$CRT_HOME/<name>/config`:
+
+```
+image  ubuntu:22.04
+mount  /data:/data
+mount  /logs:/var/log/myapp
+env    FOO=bar
+env    DEBUG=1
+memory 512M
+cpus   2
+```
+
+You can also pass a config file to `crt create`:
+
+```sh
+crt create myenv ./myenv.conf
+```
+
+The file is copied verbatim to `$CRT_HOME/myenv/config` and used as the source of truth for subsequent `crt run` invocations. Edit it directly to change defaults.
+
+| Directive | Repeatable | Description |
+|---|---|---|
+| `image` | no | OCI image reference, or `void` for xbps bootstrap |
+| `mount` | yes | `hostpath:containerpath` bind mount |
+| `env` | yes | `KEY=val` environment variable |
+| `memory` | no | Memory limit: `512M`, `2G`, etc. |
+| `cpus` | no | CPU limit as a float: `2`, `0.5` |
 
 ## Exporting binaries
 
@@ -121,6 +162,6 @@ Rootfs directories are self-contained and can be moved, copied, or archived with
 ## Limitations
 
 - No network isolation (host network stack is shared)
-- No OCI layer caching (layers are re-downloaded per `create`)
+- OCI layers are cached at `$CRT_HOME/.cache/layers/` (no automatic eviction — `rm -rf $CRT_HOME/.cache` to clear)
 - No private registry authentication
-- No resource limits (cgroups not wired up)
+- Resource limits (`memory`/`cpus`) require cgroup v2 with user delegation; degrade gracefully with a warning if unavailable
