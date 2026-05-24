@@ -248,6 +248,10 @@ Test "run: unknown flag error"
 err=$("$CRT" run -z runenv echo hi 2>&1 || true)
 if echo "$err" | grep -q "unknown option"; then Pass; else Fail; fi
 
+Test "run: mount spec without colon is rejected"
+err=$("$CRT" run -v /nocopath runenv echo hi 2>&1 || true)
+if echo "$err" | grep -q "must be host:container"; then Pass; else Fail; fi
+
 # ── cmd_list ─────────────────────────────────────────────────────────────────
 echo "# cmd_list"
 

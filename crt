@@ -362,14 +362,11 @@ cmd_create() {
 }
 
 cmd_enter() {
-    local name="$1"
-
-    if [ -z "$name" ]; then
+    if [ -z "${1:-}" ]; then
         echo "Usage: crt enter <name>"
         exit 1
     fi
-
-    cmd_run "$name" bash -l
+    cmd_run "$1" /bin/bash -l
 }
 
 cmd_run() {
@@ -416,6 +413,15 @@ cmd_run() {
     local -a all_envs=("${config_envs[@]}" "${flag_envs[@]}")
     local memory="${flag_memory:-$config_memory}"
     local cpus="${flag_cpus:-$config_cpus}"
+
+    # Validate mount specs
+    local spec
+    for spec in "${all_mounts[@]}"; do
+        if [[ "$spec" != *:* ]]; then
+            echo "Error: mount '$spec' must be host:container" >&2
+            exit 1
+        fi
+    done
 
     # Apply env vars (inherited through exec unshare automatically)
     local env_spec
