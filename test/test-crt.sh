@@ -402,7 +402,7 @@ Test "export wrapper is executable"
 if [ -x "$CRT_BIN/mytool" ]; then Pass; else Fail; fi
 
 Test "export wrapper contains correct crt run invocation"
-if grep -q "run.*$export_env.*mytool" "$CRT_BIN/mytool"; then Pass; else Fail; fi
+if grep -q "run.*$export_env.*/usr/bin/mytool" "$CRT_BIN/mytool"; then Pass; else Fail; fi
 
 Test "export with custom wrapper name"
 "$CRT" export "$export_env" mytool myalias 2>/dev/null
