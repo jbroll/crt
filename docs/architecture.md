@@ -1,0 +1,202 @@
+# Architecture
+
+How `crt` is built and why. User-facing behavior (flags, config directives,
+environment variables) is in [README.md](../README.md); this covers the
+implementation.
+
+## Single-script layout
+
+Everything lives in one file, `crt`. Command dispatch is a `case` statement
+at the bottom mapping each subcommand to a `cmd_*` function. Helpers
+(`parse_image_ref`, `oci_token`, `oci_manifest`, `oci_unpack`, `parse_memory`,
+`read_config`, `write_config`, `apply_cgroup`) sit above the `cmd_*`
+functions they support. No build step, no other files needed at runtime —
+`cp crt /usr/local/bin/crt` is the whole install.
+
+`read_config` populates `config_*` variables in the caller's scope via bash
+dynamic scoping; callers declare the matching locals before calling it. This
+avoids a struct or JSON blob for what is otherwise a dozen scalars and
+arrays, at the cost of every call site having to declare the full variable
+set up front.
+
+## Create
+
+`cmd_create` has three forms, disambiguated by the second argument: absent
+(Void/xbps), an existing file (config file), otherwise an OCI image
+reference. A config file's own `image` directive then picks xbps or OCI
+underneath. Every path ends by writing `$CRT_HOME/<name>/config`, so `crt
+run` always has a config to read regardless of how the environment was
+created.
+
+**xbps bootstrap** (`_create_xbps`) shells out to `xbps-install -r
+"$rootfs"`, installing `base-minimal` from `$VOID_REPO`. No image pull, no
+registry dependency — this is the default because it's fast and needs only
+one tool.
+
+**OCI pull** (`_create_oci`, `oci_token`, `oci_manifest`, `oci_unpack`) is
+pure shell: `curl` for HTTP, `jq` for JSON, `tar` for layers. `parse_image_ref`
+splits an image string into registry/repo/tag by inspecting the last path
+segment for a tag and the first for a registry hostname (a `.` or `:` marks
+it as a host rather than a Docker Hub user/org). `oci_token` and
+`oci_manifest` special-case Docker Hub, ghcr.io, and quay.io auth/API
+shapes and fall back to the generic OCI Distribution Spec for anything
+else. `oci_manifest` resolves a multi-arch image index to the single
+manifest matching `uname -m` before returning.
+
+`oci_unpack` downloads each layer to the cache, lists its whiteout entries
+with `tar -tzf` *before* extracting, applies deletions from those entries
+to already-extracted lower layers, then extracts the layer and deletes the
+whiteout markers it just laid down. Order matters: an opaque whiteout
+(`.wh..wh..opq`) must not be able to delete files the current layer itself
+just extracted, which is what a naive extract-then-sweep would do. Layer
+blobs are cached at `$CRT_HOME/.cache/layers/<digest-with-colon-replaced>`,
+keyed by content digest, so any environment can reuse a layer any other
+environment already pulled. A blob is written to a `.tmp` path and renamed
+into place on success, so a killed download can't leave a corrupt file at
+the real cache path (a retry always starts clean).
+
+**Config files** are line-oriented, one directive per line, unknown
+directives silently skipped for forward compatibility. `packages` (xbps
+only) is applied after `base-minimal` via `_install_packages`, and only
+when the environment was created from a config file — an inline `crt
+create name image:tag` has no place to put package names.
+
+## Run
+
+`cmd_run` builds the isolated environment inside a single `unshare` call.
+The setup script that runs inside the new namespaces is a single-quoted
+`bash -c` string; every piece of data that has to cross that boundary
+(rootfs path, `$HOME`, flags, mount specs, resolved env vars, the target
+command) goes in as positional arguments rather than interpolated into the
+string, so nothing the caller controls is ever re-parsed as shell.
+
+### Namespaces
+
+`unshare --user --map-root-user --mount --pid --uts --ipc [--net] -f`:
+user namespace for rootless operation (caller's UID maps to root inside),
+mount namespace so nothing leaks to the host, PID/UTS/IPC for process-tree,
+hostname, and shared-memory isolation. `--net` is added only for `--net
+none`; otherwise the container shares the host network stack.
+
+### pivot_root and old-root detach
+
+`crt` uses `pivot_root`, not `chroot`, and detaches the old root
+unconditionally (`umount -l /oldroot`, no redirect to a path under the new
+root — it may not exist or may be read-only). It then re-checks
+`/proc/self/mountinfo` and aborts if the old root is still mounted. This is
+the difference between `crt` and a plain chroot jail: `chroot` alone leaves
+the host filesystem reachable to a process that regains root inside the
+namespace (via `mkdir`/`chroot ..` games); `pivot_root` plus detach makes
+the host tree actually gone from the mount table.
+
+### Mounts
+
+Everything mounted before `pivot_root` goes through `canon`/`safe_dir`/
+`safe_file`, which resolve the target with `realpath` and refuse it if it
+escapes the rootfs. This defends against a rootfs left over from an earlier
+run (or crafted by whatever populated it) planting a symlink at a mount
+target — e.g. `/etc/resolv.conf` — to redirect a pre-pivot `mkdir`/`mount`
+onto a host path. A symlink found at a leaf is removed rather than
+followed.
+
+Order: `proc`, then `sys` (real `sysfs` bound from the host normally, a
+fresh `sysfs` instance when `--net none` since the container has its own
+network namespace), then a minimal `/dev` — only `null zero full random
+urandom tty` bound in from the host disk device nodes (a userns-created
+tmpfs forbids device writes, so `/dev` itself can't be a tmpfs), a fresh
+`devpts` instance, and a private tmpfs `/dev/shm`. The host `/dev` is never
+bound in whole, so block and input devices never reach the container. Then
+`resolv.conf`, `/tmp` (bind or private tmpfs per `--tmp`), `$HOME` (skipped
+under `--no-home`), then user `-v`/`mount` binds in the order given. A `:ro`
+bind is remounted read-only (`ro=recursive` where the kernel supports it)
+and then verified with `findmnt`; a still-writable submount aborts the run.
+Verification is skipped only under `CRT_TEST_MODE`, where there is no real
+mount namespace to check.
+
+### Hardened mode
+
+Requesting any isolation option (`--net none`, `--no-home`, `--tmp
+private`, a `:ro` bind, `--clean-env`, `--ro-root`) turns on hardened mode.
+Without one, `crt run` behaves like the original podman-based tool: root
+with full capabilities, so `crt run ubuntu apt install -y perl` still
+works unmodified. The logic (`hreq` vs `req` in the inner script) is: `req`
+steps always abort on failure; `hreq` steps abort only when hardened. This
+is the fail-closed rule — once isolation is requested, every step it
+depends on must succeed or the command never runs; there's no silent
+fallback to a weaker mode.
+
+After the old root is detached, a hardened run execs the target through
+`setpriv --no-new-privs --bounding-set=-all --inh-caps=-all
+--ambient-caps=-all`, resolved by absolute path inside the rootfs (never a
+PATH lookup, so a binary planted on PATH earlier can't run with
+capabilities instead). The process keeps uid 0 (so it can still write files
+the caller owns through an `rw` bind) but has no capabilities, so it can't
+remount a `:ro` bind writable, remount the root, unmount a bind to expose
+what's under it, or create new mounts.
+
+Every helper `crt` runs — `unshare`, and inside the namespace `mount`,
+`pivot_root`, `umount`, `findmnt`, `realpath`, `setpriv` — is resolved from
+a fixed trusted `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), never the
+caller's. `-e`/config env values are applied only to the target command
+(via `env`/`env -i` in the final payload), never exported into `crt`
+itself, so a caller-supplied `PATH` or `LD_PRELOAD` can't hijack `crt`'s
+own execution. `--clean-env` resolves `-e` entries in the parent shell
+(where the caller's environment is visible) before crossing into the
+namespace, then the payload runs the command under `env -i` with a minimal
+`PATH`/`HOME`.
+
+File descriptors above stderr are closed right before the final exec,
+except those named by `--keep-fd` and — if `-e NODE_CHANNEL_FD` was passed
+and that fd is actually open above stderr — the fd it names. This lets a
+parent hand the command an IPC channel (Node's `fork()`) without every
+fd the caller happened to leak becoming reachable inside the sandbox.
+
+### Network isolation
+
+`--net none` adds `--net` to the `unshare` flags (a fresh, unconfigured
+network namespace) and brings up loopback inside it. There's no bridge or
+NAT, so the container has loopback only — outbound access requires the
+default `--net host` sharing of the host stack.
+
+## Resource limits (cgroups)
+
+`apply_cgroup` runs in the parent, before `exec unshare`, so the cgroup
+membership applies to the whole namespace tree. It targets
+`/sys/fs/cgroup/user-$UID/crt-$$`, not the cgroup root — cgroup v2 forbids
+putting processes in a cgroup that has controllers enabled in its own
+`subtree_control`, so limits are only assignable in a delegated leaf.
+`crt setup` (root-only) is what creates `/sys/fs/cgroup/user-$UID/` and
+enables `+memory +cpu` in the parent's `subtree_control`; without that
+step `apply_cgroup` finds no delegated directory and warns rather than
+failing the run. On runit (Void) `crt setup` also installs
+`/etc/sv/crt-cgroup/`, a service that redoes the delegation for every
+username listed in `/etc/crt-users` on boot, since the cgroup tree doesn't
+survive a reboot. Other init systems get printed manual steps instead of
+an installed service.
+
+## Testing
+
+Two independent suites, at different levels — see
+[README.md § Testing](../README.md#testing) for how to run them.
+
+`test/test-crt.sh` runs the real `cmd_create`/`cmd_run` code paths with no
+root, namespaces, network, or xbps, by shadowing `unshare`, `pivot_root`,
+`chroot`, `mount`, `curl`, and `xbps-install` with scripts on `PATH`
+(`test/mocks/`). Test mode is gated on `CRT_TEST_MODE` naming a directory
+that carries a marker file, `test/mocks/.crt-mocks` — not just being set —
+so a stray `CRT_TEST_MODE=1` inherited by a real invocation can't
+accidentally disable isolation. When active, it prepends the mocks
+directory to `crt`'s trusted binary-resolution `PATH`, lets `cmd_run` fall
+back to `chroot` when the mock `pivot_root` (which always fails) is
+invoked, and skips read-only bind verification, since there's no real
+mount namespace for `findmnt` to inspect.
+
+`test/test-isolation.sh` is the real thing: it builds a throwaway rootfs
+that reuses the host `/usr` (bind-mounted read-only) and runs actual
+`unshare`/`pivot_root` namespaces, mostly from one invocation with the full
+isolation flag set. It proves the properties the mock suite can't: the old
+root is actually gone, the capability drop actually blocks remount/
+unmount/new-mount, the minimal `/dev` has no block or input devices, a
+`:ro` bind actually rejects writes, a planted `resolv.conf`/`/dev` symlink
+is not followed, and a default (non-hardened) run is unchanged. It
+self-skips when unprivileged user namespaces aren't available on the host.

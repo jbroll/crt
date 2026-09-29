@@ -2,6 +2,8 @@
 
 Minimal chroot manager. Creates and runs isolated rootfs environments using Linux namespace primitives — no Docker, no podman.
 
+See [docs/architecture.md](docs/architecture.md) for how it's built.
+
 ## How it works
 
 `crt create` builds a rootfs directory. `crt run` executes commands inside it using `unshare` + `pivot_root` for isolation:
