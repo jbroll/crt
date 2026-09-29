@@ -1,6 +1,7 @@
 #!/bin/sh
-# Mock xbps-install: create a minimal rootfs skeleton
-# Real xbps-install uses -r <rootfs> as its first two args
+# Mock xbps-install: optionally log args, then create a minimal rootfs skeleton.
+# Real xbps-install uses -r <rootfs> and needs -S to sync the remote index.
+[ -n "$CRT_MOCK_LOG" ] && echo "xbps-install $*" >> "$CRT_MOCK_LOG"
 while [ $# -gt 0 ]; do
     case "$1" in
         -r) rootfs="$2"; shift 2 ;;

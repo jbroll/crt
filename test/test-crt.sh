@@ -21,7 +21,19 @@ CRT_HOME=$(mktemp -d)
 export CRT_HOME
 CRT_BIN=$(mktemp -d)
 export CRT_BIN
-trap 'rm -rf "$CRT_HOME" "$CRT_BIN"' EXIT
+
+# Hermetic xbps repo keys: _xbps_trust_keys copies *.plist from XBPS_KEYS_DIR
+# into the rootfs before bootstrap. Point it at a fake dir so create tests do
+# not depend on the host's /var/db/xbps/keys.
+XBPS_KEYS_DIR=$(mktemp -d)
+export XBPS_KEYS_DIR
+printf '<plist/>\n' > "$XBPS_KEYS_DIR/fake-key.plist"
+
+trap 'rm -rf "$CRT_HOME" "$CRT_BIN" "$XBPS_KEYS_DIR"' EXIT
+
+# crt stores per-rootfs config outside every rootfs, at $CRT_HOME/.config/<name>.
+conf() { printf '%s' "$CRT_HOME/.config/$1"; }
+set_config() { mkdir -p "$CRT_HOME/.config"; cat > "$CRT_HOME/.config/$1"; }
 
 # Helper: extract a pure function from crt and run it in a subshell.
 # Works for functions whose body contains no nested { } blocks (case/while/if are fine).
@@ -37,7 +49,7 @@ $fn \"\$@\"" -- "$@"
 make_rootfs() {
     local name="$1"
     local dir="$CRT_HOME/$name"
-    mkdir -p "$dir/bin"
+    mkdir -p "$dir/bin" "$CRT_HOME/.config"
     printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$dir/bin/sh"
     chmod +x "$dir/bin/sh"
 }
@@ -218,8 +230,23 @@ Test "create xbps path: rootfs exists"
 "$CRT" create voidenv 2>/dev/null
 if [ -d "$CRT_HOME/voidenv/bin" ]; then Pass; else Fail; fi
 
-Test "create xbps path: config written with image void"
-CompareArgs "$(cat "$CRT_HOME/voidenv/config")" "image void"
+Test "create xbps path: config written outside the rootfs with image void"
+CompareArgs "$(cat "$(conf voidenv)")" "image void"
+
+Test "create xbps path: no config left inside the rootfs"
+if [ -e "$CRT_HOME/voidenv/config" ]; then Fail; else Pass; fi
+
+Test "create xbps path: xbps-install run with -S and keys copied"
+klog=$(mktemp)
+CRT_MOCK_LOG="$klog" "$CRT" create keyenv 2>/dev/null
+if grep -q -- ' -S ' "$klog" && [ -f "$CRT_HOME/keyenv/var/db/xbps/keys/fake-key.plist" ]; then Pass; else Fail; fi
+rm -f "$klog"
+
+Test "create xbps path: aborts clearly when no repo keys are present"
+emptykeys=$(mktemp -d)
+out=$(XBPS_KEYS_DIR="$emptykeys" "$CRT" create nokeyenv 2>&1 || true)
+if echo "$out" | grep -q "no xbps repo keys"; then Pass; else Fail; fi
+rmdir "$emptykeys"
 
 Test "create xbps path: duplicate is rejected"
 out=$("$CRT" create voidenv 2>&1 || true)
@@ -229,16 +256,16 @@ Test "create OCI path: rootfs exists"
 "$CRT" create ocienv alpine:3.19 2>/dev/null
 if [ -d "$CRT_HOME/ocienv/bin" ]; then Pass; else Fail; fi
 
-Test "create OCI path: config written with image ref"
-CompareArgs "$(cat "$CRT_HOME/ocienv/config")" "image alpine:3.19"
+Test "create OCI path: config written outside with image ref"
+CompareArgs "$(cat "$(conf ocienv)")" "image alpine:3.19"
 
-Test "create config-file path: config copied verbatim"
+Test "create config-file path: config copied verbatim (outside the rootfs)"
 cat > "$CONF" << 'EOF'
 image alpine:3.19
 env TEST=1
 EOF
 "$CRT" create fileenv "$CONF" 2>/dev/null
-CompareFiles "$CONF" "$CRT_HOME/fileenv/config"
+CompareFiles "$CONF" "$(conf fileenv)"
 
 Test "create config-file with image void: uses xbps"
 cat > "$CONF" << 'EOF'
@@ -246,7 +273,7 @@ image void
 env MYVAR=hello
 EOF
 "$CRT" create voidfromfile "$CONF" 2>/dev/null
-if diff "$CRT_HOME/voidfromfile/config" "$CONF" >/dev/null 2>&1 && \
+if diff "$(conf voidfromfile)" "$CONF" >/dev/null 2>&1 && \
    [ -f "$CRT_HOME/voidfromfile/bin/sh" ]; then Pass; else Fail; fi
 
 Test "create config-file with no image: uses xbps"
@@ -265,22 +292,22 @@ err=$("$CRT" run noexist echo hi 2>&1 >/dev/null || true)
 if echo "$err" | grep -q "not found"; then Pass; else Fail; fi
 
 Test "run: env var from config"
-printf 'env GREETING=hello\n' > "$CRT_HOME/runenv/config"
+printf 'env GREETING=hello\n' > "$(conf runenv)"
 result=$("$CRT" run runenv printenv GREETING 2>/dev/null)
 CompareArgs "$result" "hello"
 
 Test "run: -e flag sets env var"
-printf '' > "$CRT_HOME/runenv/config"
+printf '' > "$(conf runenv)"
 result=$("$CRT" run -e COLOR=blue runenv printenv COLOR 2>/dev/null)
 CompareArgs "$result" "blue"
 
 Test "run: -e flag overrides config env"
-printf 'env MODE=production\n' > "$CRT_HOME/runenv/config"
+printf 'env MODE=production\n' > "$(conf runenv)"
 result=$("$CRT" run -e MODE=debug runenv printenv MODE 2>/dev/null)
 CompareArgs "$result" "debug"
 
 Test "run: multiple -e flags"
-printf '' > "$CRT_HOME/runenv/config"
+printf '' > "$(conf runenv)"
 result=$("$CRT" run -e A=1 -e B=2 runenv sh -c 'echo $A-$B' 2>/dev/null)
 CompareArgs "$result" "1-2"
 
@@ -496,7 +523,7 @@ packages git
 echo "# cmd_run isolation flags"
 
 make_rootfs isoenv
-printf '' > "$CRT_HOME/isoenv/config"
+printf '' > "$(conf isoenv)"
 
 # Run crt with a mock-call log and print the log to stdout.
 run_logged() {
@@ -514,14 +541,14 @@ Test "run: --net none adds --net to unshare"
 if run_logged --net none isoenv true | grep -q '^unshare .*--net'; then Pass; else Fail; fi
 
 Test "run: net directive from config adds --net"
-printf 'net none\n' > "$CRT_HOME/isoenv/config"
+printf 'net none\n' > "$(conf isoenv)"
 if run_logged isoenv true | grep -q '^unshare .*--net'; then Pass; else Fail; fi
-printf '' > "$CRT_HOME/isoenv/config"
+printf '' > "$(conf isoenv)"
 
 Test "run: --net host flag overrides config net none"
-printf 'net none\n' > "$CRT_HOME/isoenv/config"
+printf 'net none\n' > "$(conf isoenv)"
 if run_logged --net host isoenv true | grep -q '^unshare .*--net'; then Fail; else Pass; fi
-printf '' > "$CRT_HOME/isoenv/config"
+printf '' > "$(conf isoenv)"
 
 Test "run: default binds \$HOME"
 if run_logged isoenv true | grep -q -- "^mount --bind $HOME "; then Pass; else Fail; fi
@@ -630,10 +657,10 @@ result=$(NODE_CHANNEL_FD=notanfd "$CRT" run --clean-env -e NODE_CHANNEL_FD isoen
 CompareArgs "$result" "ok"
 
 Test "run: keep-fd directive from config keeps the fd open"
-printf 'keep-fd 3\n' > "$CRT_HOME/isoenv/config"
+printf 'keep-fd 3\n' > "$(conf isoenv)"
 result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'cfg-fd' 2>/dev/null)
 CompareArgs "$result" "cfg-fd"
-printf '' > "$CRT_HOME/isoenv/config"
+printf '' > "$(conf isoenv)"
 
 Test "run: --keep-fd rejects a non-numeric value"
 err=$("$CRT" run --keep-fd abc isoenv true 2>&1 || true)
@@ -668,5 +695,69 @@ loggate=$(mktemp)
 CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true
 if grep -q '^unshare ' "$loggate"; then Pass; else Fail; fi
 rm -f "$loggate"
+
+Test "run: a relative CRT_TEST_MODE does not arm test mode (item 5)"
+# A relative path (even one with a marker in cwd) must not enable test mode.
+mkdir -p "$CRT_HOME/reltm"; : > "$CRT_HOME/reltm/.crt-mocks"
+loggate=$(mktemp)
+( cd "$CRT_HOME" && CRT_TEST_MODE=reltm CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true )
+if grep -q '^unshare ' "$loggate"; then Fail; else Pass; fi
+rm -f "$loggate"
+
+# ── ignore caller-exported shell functions (item 5) ───────────────────────────
+echo "# exported function immunity"
+
+Test "run: a caller-exported function named like a command is ignored"
+# Export a function 'unshare'; crt must clear inherited functions and use the
+# real (mock) binary, not the function.
+loggate=$(mktemp)
+unshare() { echo FAKE-UNSHARE-RAN; }
+export -f unshare
+out=$(CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true 2>&1 || true)
+unset -f unshare
+if ! echo "$out" | grep -q FAKE-UNSHARE-RAN && grep -q '^unshare ' "$loggate"; then Pass; else Fail; fi
+rm -f "$loggate"
+
+# ── New-6: hardened mode refuses a tainted rootfs ─────────────────────────────
+echo "# New-6 pristine-rootfs requirement"
+
+Test "run: hardened run is refused on a tainted rootfs"
+mkdir -p "$CRT_HOME/.state"; : > "$CRT_HOME/.state/isoenv.tainted"
+err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
+if echo "$err" | grep -q "requires a pristine rootfs"; then Pass; else Fail; fi
+
+Test "run: a default run is still allowed on a tainted rootfs"
+result=$("$CRT" run isoenv sh -c 'echo ok' 2>/dev/null)
+CompareArgs "$result" "ok"
+rm -f "$CRT_HOME/.state/isoenv.tainted"
+
+# ── stored config lives outside the rootfs (New-6) ────────────────────────────
+echo "# stored config location"
+
+Test "run: config is read from outside the rootfs, not from /config in it"
+# A file planted at <rootfs>/config must be ignored; the outside config wins.
+printf 'env WHO=outside\n' > "$(conf isoenv)"
+printf 'env WHO=inside\n' > "$CRT_HOME/isoenv/config"
+result=$("$CRT" run isoenv printenv WHO 2>/dev/null)
+CompareArgs "$result" "outside"
+rm -f "$CRT_HOME/isoenv/config"; printf '' > "$(conf isoenv)"
+
+Test "run: a legacy in-rootfs config is migrated out on first use"
+make_rootfs legacyenv
+rm -f "$(conf legacyenv)"
+printf 'env LEG=migrated\n' > "$CRT_HOME/legacyenv/config"
+result=$("$CRT" run legacyenv printenv LEG 2>/dev/null)
+if [ "$result" = "migrated" ] && [ -f "$(conf legacyenv)" ] && [ ! -e "$CRT_HOME/legacyenv/config" ]; then Pass; else Fail; fi
+
+# ── symlinked CRT_HOME works (item 4) ─────────────────────────────────────────
+echo "# symlinked CRT_HOME"
+
+Test "run: works when CRT_HOME is reached through a symlink"
+real_home=$(mktemp -d); link_home=$(mktemp -u)
+ln -s "$real_home" "$link_home"
+CRT_HOME="$real_home" make_rootfs symenv
+result=$(CRT_HOME="$link_home" "$CRT" run symenv sh -c 'echo linked-ok' 2>/dev/null)
+CompareArgs "$result" "linked-ok"
+rm -rf "$real_home"; rm -f "$link_home"
 
 TestDone

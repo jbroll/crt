@@ -56,9 +56,23 @@ Any isolation option (`--net none`, `--no-home`, `--tmp private`, a `:ro` bind,
   with `realpath` and refused if it escapes the rootfs; a symlink planted at a
   leaf (e.g. `/etc/resolv.conf`) is removed rather than followed. A poisoned
   rootfs from an earlier run cannot redirect setup to a host path.
+- **Read-only, pristine rootfs required.** The old-root detach and capability
+  drop after `pivot_root` run the rootfs's own `umount`/`setpriv` while still
+  privileged, so a hardened run trusts the rootfs is unmodified. crt enforces
+  that: a hardened run forces the rootfs read-only for the duration, and it
+  **refuses** to run hardened on a rootfs that has ever been run writable since
+  it was created (tracked by a marker in `$CRT_HOME/.state/`, outside the
+  rootfs, that a container cannot clear). To use a rootfs for untrusted code,
+  create it and only ever run it hardened; recreate it if a writable run tainted
+  it. The rootfs's privileged binaries are trusted — see [Limitations](#limitations).
 
 Without any isolation option, `crt run` behaves as before: the command runs as
-root with capabilities, so `crt run ubuntu apt install -y perl` still works.
+root with capabilities, so `crt run ubuntu apt install -y perl` still works
+(and marks the rootfs tainted, so a later hardened run of it is refused).
+
+The stored config never lives inside a rootfs (see [Config files](#config-files)),
+so a container cannot read or rewrite the config that governs its own — or a
+later — run.
 
 ### File descriptors
 
@@ -132,7 +146,13 @@ If `crt setup` hasn't been run, `crt run -m 512M ...` warns and continues withou
 crt create myenv
 ```
 
-Uses `xbps-install` to bootstrap `base-minimal` into a new rootfs directory. Fast, no network image pull.
+Uses `xbps-install -S` to sync the Void repository index and bootstrap
+`base-minimal` into a new rootfs directory. The host's repo signing keys
+(`/var/db/xbps/keys/*.plist`, shipped by the `xbps` package) are copied into the
+rootfs first so the non-interactive install can verify packages; if the host has
+no such keys, `crt create` fails with a clear message — install `xbps` or
+bootstrap from an OCI image instead. Set `XBPS_KEYS_DIR` to override the key
+source.
 
 **From an OCI registry:**
 
@@ -161,7 +181,11 @@ crt run ubuntu make install    # runs in /home/john/project inside the container
 
 ## Config files
 
-Each environment stores its config at `$CRT_HOME/<name>/config`:
+Each environment's config is stored **outside** the rootfs, at
+`$CRT_HOME/.config/<name>`, so a container can neither read nor rewrite the
+config that governs its own — or a later — run. (A legacy config found inside a
+rootfs is migrated out, by moving it, the first time that rootfs is run.) The
+directives:
 
 ```
 image     ubuntu:22.04
@@ -185,7 +209,7 @@ You can also pass a config file to `crt create`:
 crt create myenv ./myenv.conf
 ```
 
-The file is copied verbatim to `$CRT_HOME/myenv/config` and used as the source of truth for subsequent `crt run` invocations. Edit it directly to change defaults.
+The file is copied verbatim to `$CRT_HOME/.config/myenv` and used as the source of truth for subsequent `crt run` invocations. Edit it there to change defaults.
 
 | Directive | Repeatable | Description |
 |---|---|---|
@@ -228,7 +252,7 @@ Add `CRT_BIN` to your `PATH` and the binary behaves as if installed on the host.
 
 | Operation | Requires |
 |---|---|
-| `crt create <name>` (Void) | `xbps-install` |
+| `crt create <name>` (Void) | `xbps-install`, plus the host's repo keys in `/var/db/xbps/keys/` |
 | `crt create <name> <image>` (OCI) | `curl`, `jq`, `tar` |
 | `crt run` / `crt enter` | `unshare`, `pivot_root`, `chroot` (util-linux) |
 | `crt run` (hardened) | also `setpriv`, `findmnt` (util-linux) and `realpath` (coreutils), inside the rootfs |
@@ -253,11 +277,17 @@ Each environment is a plain directory under `CRT_HOME`:
   bin/           ← CRT_BIN: exported wrapper scripts
     perl
     python
+  .config/       ← per-rootfs stored config (outside every rootfs)
+    ubuntu
+    myenv
+  .state/        ← per-rootfs taint markers (<name>.tainted)
   .cache/
     layers/      ← OCI layer blobs, keyed by digest
 ```
 
-Rootfs directories are self-contained and can be moved, copied, or archived with `tar`.
+Rootfs directories are self-contained; when moving or archiving one, take its
+`.config/<name>` entry with it. `.state/<name>.tainted`, if present, records that
+the rootfs was run writable and so is refused for hardened runs.
 
 OCI layers are cached in `.cache/layers/` and reused across environments. There is no automatic eviction — run `rm -rf $CRT_HOME/.cache` to clear.
 
@@ -277,22 +307,24 @@ bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
 | `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
 | `mount` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), then no-op |
 | `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
-| `xbps-install` | xbps | Creates a minimal `bin/sh` skeleton in the rootfs |
+| `xbps-install` | xbps | Logs its args (when `CRT_MOCK_LOG` is set), then creates a minimal `bin/sh` skeleton in the rootfs |
 
 `test/test-crt.sh` sets `CRT_TEST_MODE` to the mocks directory, which carries a
 marker file (`test/mocks/.crt-mocks`). Test mode is enabled only when
-`CRT_TEST_MODE` names such a directory: it routes `crt`'s binary resolution
-through the mocks, lets `cmd_run` fall back to `chroot`, and skips read-only
-verification when the mock `pivot_root` fails. A bare `CRT_TEST_MODE=1` inherited
-by a production run does nothing. This lets the full `cmd_create` and `cmd_run`
-code paths run without root, namespaces, network, or xbps. 101 tests cover
-`parse_memory`, `read_config` (including the
+`CRT_TEST_MODE` is an **absolute** path to such a directory: it routes `crt`'s
+binary resolution through the mocks, lets `cmd_run` fall back to `chroot`, and
+skips read-only verification when the mock `pivot_root` fails. A bare
+`CRT_TEST_MODE=1`, or a relative path, does nothing. This lets the full
+`cmd_create` and `cmd_run` code paths run without root, namespaces, network, or
+xbps. 111 tests cover `parse_memory`, `read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
-`write_config`, `parse_image_ref`, all three `create` dispatch paths, `run` flag
-and config merging, the generated `unshare`/`mount` calls for each isolation
-flag, clean-env behavior, `--keep-fd`/fd closing and the `NODE_CHANNEL_FD`
-guards, the marker-gated test-mode switch, `list`, `rm`, OCI layer cache reuse,
-`export`, and `setup`.
+`write_config`, `parse_image_ref`, all three `create` dispatch paths (with the
+`xbps-install -S` / key-copy path), `run` flag and config merging, the generated
+`unshare`/`mount` calls for each isolation flag, clean-env behavior,
+`--keep-fd`/fd closing and the `NODE_CHANNEL_FD` guards, the marker-gated
+absolute-path test-mode switch, immunity to caller-exported shell functions, the
+out-of-rootfs config and legacy migration, the tainted-rootfs refusal, a
+symlinked `CRT_HOME`, `list`, `rm`, OCI layer cache reuse, `export`, and `setup`.
 
 `test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
 (bind-mounted read-only) and proves, in real namespaces, mostly from one run
@@ -306,10 +338,19 @@ automatically, `--net none` blocks the network, and a default run is unchanged
 (uid 0 with capabilities, `$HOME` visible). It also checks that an `-e PATH`
 cannot substitute `crt`'s `unshare`, that a PATH-planted `setpriv` is not used
 (caps still dropped), and that planted `resolv.conf`/`/dev` symlinks in the
-rootfs are not followed. 29 checks.
+rootfs are not followed. It also checks the out-of-rootfs config is unreachable
+to the container, and that hardened runs are refused on a rootfs previously run
+writable (the poisoned-rootfs / planted-`umount`/`setpriv` defense). 33 checks.
 
 ## Limitations
 
 - No private registry authentication
 - Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup))
 - `--net none` isolates the network but provides no NAT/bridge, so the container has loopback only (no outbound access)
+- **The rootfs is trusted in hardened mode.** After `pivot_root`, crt runs the
+  rootfs's own `umount` and `setpriv` while still privileged, so a modified
+  rootfs could defeat isolation. crt guards this by forcing the rootfs read-only
+  and refusing any rootfs run writable since it was created — but it does not
+  otherwise verify the rootfs contents. Build the rootfs from a trusted source
+  (`crt create`, or bind the host `/usr` read-only) and only ever run it
+  hardened.

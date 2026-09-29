@@ -30,13 +30,21 @@ fi
 # ── throwaway rootfs that borrows the host /usr at run time ───────────────────
 WORK="$(mktemp -d)"
 export CRT_HOME="$WORK/home"
+
+# Build a throwaway rootfs <name> whose stored config lives outside the rootfs
+# (as the real crt now keeps it).
+build_rootfs() {
+    local n="$1" r="$CRT_HOME/$1"
+    mkdir -p "$r"/{etc,proc,dev,tmp,usr/bin,usr/lib} "$CRT_HOME/.config"
+    local d t
+    for d in bin lib lib64 sbin; do
+        t="$(readlink "/$d" 2>/dev/null)" && ln -s "$t" "$r/$d"
+    done
+    printf 'image void\n' > "$CRT_HOME/.config/$n"
+}
 NAME=iso
-R="$CRT_HOME/$NAME"
-mkdir -p "$R"/{etc,proc,dev,tmp,usr/bin,usr/lib}
-for d in bin lib lib64 sbin; do
-    t="$(readlink "/$d" 2>/dev/null)" && ln -s "$t" "$R/$d"
-done
-printf 'image void\n' > "$R/config"
+build_rootfs iso        # pristine; used for all hardened runs
+build_rootfs isodef     # used for the writable default-behavior run (taints it)
 
 HOST_HOME_CANARY="$HOME/.crt_iso_canary.$$"
 echo secret > "$HOST_HOME_CANARY" 2>/dev/null || HOST_HOME_CANARY=""
@@ -126,7 +134,7 @@ check "NODE_CHANNEL_FD fd kept open automatically" "fd-payload-42" "$result"
 DEF='echo "UID=$(id -u)"
 echo "CAP0=$(awk "/^CapEff/{print \$2}" /proc/self/status | grep -q "^0*$" && echo yes || echo no)"
 [ -e "$1" ] && echo "CANARY=visible" || echo "CANARY=hidden"'
-OUT="$("$CRT" run "${USR_RW[@]}" "$NAME" /bin/bash -c "$DEF" bash "$HOST_HOME_CANARY" 2>/dev/null)"
+OUT="$("$CRT" run "${USR_RW[@]}" isodef /bin/bash -c "$DEF" bash "$HOST_HOME_CANARY" 2>/dev/null)"
 check "default: command runs as uid 0"       "0"        "$(printf '%s\n' "$OUT" | sed -n 's/^UID=//p')"
 check "default: capabilities retained"       "no"       "$(printf '%s\n' "$OUT" | sed -n 's/^CAP0=//p')"
 if [ -n "$HOST_HOME_CANARY" ]; then
@@ -180,6 +188,29 @@ ln -sf "$OUTDEV" "$P7B/dev"
 if "$CRT" run --no-home "${USR_RO[@]}" poison7b /bin/true 2>/dev/null; then rc7=ran; else rc7=aborted; fi
 check "finding7: planted /dev symlink aborts the run" "aborted" "$rc7"
 check "finding7: no device node created in the outside dir" "0" "$(find "$OUTDEV" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+
+# ── New-6: stored config is outside the rootfs and unreachable to the container ─
+cfg_before="$(cat "$CRT_HOME/.config/iso")"
+out="$("$CRT" run --clean-env --no-home --ro-root "${USR_RO[@]}" iso \
+    /bin/sh -c 'echo pwned > /config 2>/dev/null; cat /config 2>/dev/null || echo absent' 2>/dev/null)"
+check "New-6: no stored config is visible as /config in the container" "absent" "$out"
+check "New-6: container cannot change the host-side stored config" "$cfg_before" "$(cat "$CRT_HOME/.config/iso")"
+
+# ── New-6: a rootfs ever run writable is refused for hardened use ──────────────
+# This is the defense against a poisoned rootfs (planted umount/setpriv): a
+# writable run taints it, and hardened mode then refuses it. Plant fake
+# privileged helpers first to make the scenario concrete.
+build_rootfs poisonbin
+printf '#!/bin/sh\ntrue\n' > "$CRT_HOME/poisonbin/usr/bin/umount"
+printf '#!/bin/sh\nexec "$@"\n'  > "$CRT_HOME/poisonbin/usr/bin/setpriv"
+chmod +x "$CRT_HOME/poisonbin/usr/bin/umount" "$CRT_HOME/poisonbin/usr/bin/setpriv"
+"$CRT" run "${USR_RW[@]}" poisonbin /bin/true 2>/dev/null || true   # writable run -> taints
+if "$CRT" run --clean-env --ro-root "${USR_RO[@]}" poisonbin /bin/true 2>/dev/null; then pb=ran; else pb=refused; fi
+check "New-6: hardened refused on a rootfs with planted helpers (tainted)" "refused" "$pb"
+
+# isodef was run writable by the default-behaviour block above; hardened refused.
+if "$CRT" run --clean-env "${USR_RO[@]}" isodef /bin/true 2>/dev/null; then td=ran; else td=refused; fi
+check "New-6: hardened refused on the previously-writable default rootfs" "refused" "$td"
 
 echo
 echo "passed $pass, failed $fail"

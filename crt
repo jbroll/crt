@@ -12,8 +12,27 @@
 
 set -e
 
+# Drop any shell functions the caller exported into our environment (bash
+# exports them as BASH_FUNC_* env vars and auto-imports them). Otherwise a
+# caller function named like a command crt runs (mount, unshare, ...) would
+# shadow the real binary. Clear the inherited function table before we define
+# our own, and strip the BASH_FUNC_* / BASH_ENV carriers so children are clean.
+_crt_inherited_fns=$(compgen -A function 2>/dev/null || true)
+# shellcheck disable=SC2086  # deliberate word split: one function name per word
+[ -n "$_crt_inherited_fns" ] && unset -f $_crt_inherited_fns 2>/dev/null || true
+unset _crt_inherited_fns
+for _v in $(compgen -e 2>/dev/null); do
+    case "$_v" in BASH_FUNC_*|BASH_ENV) unset "$_v" 2>/dev/null || true ;; esac
+done
+unset _v
+
 CRT_HOME="${CRT_HOME:-/home/crt}"
 CRT_BIN="${CRT_BIN:-/home/crt/bin}"
+
+# Per-rootfs stored config and state live OUTSIDE every rootfs, so a container
+# can neither read nor rewrite the config that governs its own (or a later) run.
+CRT_CONF_DIR="$CRT_HOME/.config"
+CRT_STATE_DIR="$CRT_HOME/.state"
 
 parse_image_ref() {
     local input="$1"
@@ -308,6 +327,25 @@ apply_cgroup() {
     fi
 }
 
+_xbps_trust_keys() {
+    # xbps-install into an empty rootfs has no repo signing keys, so it stops to
+    # import them — which fails non-interactively ("failed to import public
+    # key"). Trust the host's keys by copying them in before the install.
+    local rootfs="$1"
+    local src="${XBPS_KEYS_DIR:-/var/db/xbps/keys}"
+
+    local count=0 f
+    for f in "$src"/*.plist; do [ -e "$f" ] && count=$((count + 1)); done
+    if [ "$count" -eq 0 ]; then
+        echo "Error: no xbps repo keys found in $src on this host." >&2
+        echo "  Install the 'xbps' package (it ships the Void repo keys) or bootstrap" >&2
+        echo "  from an OCI image instead (e.g. crt create $rootfs alpine:3.19)." >&2
+        return 1
+    fi
+    mkdir -p "$rootfs/var/db/xbps/keys"
+    cp -- "$src"/*.plist "$rootfs/var/db/xbps/keys/"
+}
+
 _create_xbps() {
     local rootfs="$1"
     local repo="${VOID_REPO:-https://repo-default.voidlinux.org/current}"
@@ -317,8 +355,11 @@ _create_xbps() {
         return 1
     fi
 
+    _xbps_trust_keys "$rootfs" || return 1
     echo "Bootstrapping Void Linux via xbps..."
-    xbps-install -r "$rootfs" --repository="$repo" -y base-minimal
+    # -S syncs the remote repository index first (without it, base-minimal is
+    # "not found" because the local index is empty).
+    xbps-install -S -r "$rootfs" --repository="$repo" -y base-minimal
 }
 
 _install_packages() {
@@ -332,7 +373,7 @@ _install_packages() {
     fi
 
     echo "Installing packages: $*"
-    xbps-install -r "$rootfs" --repository="$repo" -y "$@"
+    xbps-install -S -r "$rootfs" --repository="$repo" -y "$@"
 }
 
 _create_oci() {
@@ -376,10 +417,11 @@ cmd_create() {
         exit 1
     fi
 
-    mkdir -p "$rootfs"
-    trap 'rm -rf "$rootfs"' ERR
-
-    local stored_config="$CRT_HOME/$name/config"
+    local stored_config="$CRT_CONF_DIR/$name"
+    mkdir -p "$rootfs" "$CRT_CONF_DIR" "$CRT_STATE_DIR"
+    trap 'rm -rf "$rootfs" "$stored_config" "$CRT_STATE_DIR/$name.tainted"' ERR
+    # A freshly created rootfs is pristine: clear any stale taint marker.
+    rm -f "$CRT_STATE_DIR/$name.tainted"
 
     if [ -z "$arg" ]; then
         _create_xbps "$rootfs"
@@ -470,11 +512,28 @@ cmd_run() {
         exit 1
     fi
 
+    # Canonicalise the rootfs once, so a symlinked CRT_HOME component does not
+    # make every later "path escapes rootfs" check fail.
+    local rootfs_real
+    rootfs_real=$(realpath -e -- "$rootfs") \
+        || { echo "Error: cannot resolve rootfs path $rootfs" >&2; exit 1; }
+    rootfs="$rootfs_real"
+
+    # Stored config lives outside every rootfs so a container cannot read or
+    # rewrite the config that governs its own (or a later) run. Migrate a legacy
+    # in-rootfs config once, by moving it out (never copying, never reading it
+    # from inside the rootfs afterwards).
+    local stored_config="$CRT_CONF_DIR/$name"
+    if [ ! -f "$stored_config" ] && [ -f "$rootfs/config" ]; then
+        mkdir -p "$CRT_CONF_DIR"
+        mv -- "$rootfs/config" "$stored_config"
+    fi
+
     # Load stored config
     local config_image="" config_memory="" config_cpus=""
     local config_net="" config_home="" config_tmp="" config_envclean="" config_root=""
     local -a config_mounts=() config_envs=() config_packages=() config_keepfds=()
-    read_config "$rootfs/config"
+    read_config "$stored_config"
 
     # Merge: config first, flags override/extend
     local -a all_mounts=("${config_mounts[@]}" "${flag_mounts[@]}")
@@ -527,15 +586,42 @@ cmd_run() {
     local crt_trusted="/usr/bin:/bin:/usr/sbin:/sbin"
     local crt_binpath="$crt_trusted"
 
-    # Test mode is enabled only when CRT_TEST_MODE names a directory carrying the
-    # mocks' marker file. A bare CRT_TEST_MODE=1, or any value inherited from the
-    # environment that is not the real mocks dir, does nothing. It routes binary
-    # resolution through the mocks, allows the chroot fallback, and skips the
-    # findmnt-based ro verification (there is no real mount namespace under test).
+    # Test mode is enabled only when CRT_TEST_MODE is an ABSOLUTE path to a
+    # directory carrying the mocks' marker file. A bare CRT_TEST_MODE=1, a
+    # relative path, or any inherited value that is not a real mocks dir does
+    # nothing. It routes binary resolution through the mocks, allows the chroot
+    # fallback, and skips the findmnt-based ro verification (no real mount
+    # namespace under test).
     local crt_test=0
-    if [ -n "${CRT_TEST_MODE:-}" ] && [ -f "${CRT_TEST_MODE}/.crt-mocks" ]; then
-        crt_test=1
-        crt_binpath="${CRT_TEST_MODE}:$crt_trusted"
+    case "${CRT_TEST_MODE:-}" in
+        /*) if [ -f "${CRT_TEST_MODE}/.crt-mocks" ]; then
+                crt_test=1
+                crt_binpath="${CRT_TEST_MODE}:$crt_trusted"
+            fi ;;
+    esac
+
+    # Hardened mode runs rootfs binaries (umount, setpriv) after pivot_root while
+    # still privileged, so it can only be trusted on a rootfs that has never been
+    # writable to a container. Enforce that: force the rootfs read-only for this
+    # run, and refuse if it was ever run writable since it was created. The taint
+    # marker lives outside the rootfs, so a container cannot clear it.
+    local taint="$CRT_STATE_DIR/$name.tainted"
+    if [ "$hardened" = 1 ]; then
+        ro_root=1
+        if [ -e "$taint" ]; then
+            echo "Error: '$name' has been run writable since it was created;" >&2
+            echo "  hardened isolation requires a pristine rootfs (its umount/setpriv" >&2
+            echo "  could have been replaced). Recreate it and only run it read-only:" >&2
+            echo "    crt rm $name && crt create $name ...   # then run with --ro-root" >&2
+            exit 1
+        fi
+    fi
+    # Any run whose rootfs is writable may modify it, so mark it tainted (outside
+    # the rootfs) before launching. Pristine, hardened (ro) runs never taint.
+    # Skipped under test mode (mocks perform no real writes and rootfs are reused).
+    if [ "$ro_root" != 1 ] && [ "$crt_test" != 1 ]; then
+        mkdir -p "$CRT_STATE_DIR"
+        : > "$taint"
     fi
 
     local UNSHARE
@@ -617,15 +703,18 @@ cmd_run() {
                     *) crt_die "path escapes rootfs: $1 -> $t" ;; esac
             }
             # safe_dir: canonical dir under the rootfs, created; refuses a symlink escape.
-            safe_dir() { local d; d=$(canon "$1"); mkdir -p "$d" || crt_die "mkdir $1"; printf "%s\n" "$d"; }
+            # canon runs in a command substitution, so it exits only this subshell;
+            # the caller must guard the assignment (x=$(safe_dir …) || crt_die).
+            safe_dir() { local d; d=$(canon "$1") || exit 1; mkdir -p "$d" || exit 1; printf "%s\n" "$d"; }
             # safe_file: a regular file to use as a bind target. The parent dir must be
             # under the rootfs; a symlink planted at the leaf is removed, never followed.
             safe_file() {
                 local p d b
-                d=$(canon "$(dirname -- "$1")"); mkdir -p "$d" || crt_die "mkdir $(dirname -- "$1")"
+                d=$(canon "$(dirname -- "$1")") || exit 1
+                mkdir -p "$d" || exit 1
                 b=$(basename -- "$1"); p="$d/$b"
                 [ -L "$p" ] && rm -f "$p"
-                [ -e "$p" ] || : > "$p" || crt_die "cannot create $p"
+                [ -e "$p" ] || : > "$p" || exit 1
                 printf "%s\n" "$p"
             }
             # verify_ro: every mount at/under $1 must be read-only (fail closed).
@@ -642,14 +731,14 @@ RO
 
             # All fixed setup paths go through canon/safe_* so a symlink planted inside
             # the rootfs cannot redirect a mkdir/touch/mount to a host path.
-            rproc=$(safe_dir "$rootfs/proc")
-            retc=$(safe_dir "$rootfs/etc")
-            safe_dir "$rootfs/oldroot" >/dev/null
-            rdev=$(safe_dir "$rootfs/dev")
-            rpts=$(safe_dir "$rootfs/dev/pts")
-            rshm=$(safe_dir "$rootfs/dev/shm")
-            rtmp=$(safe_dir "$rootfs/tmp")
-            rsys=$(safe_dir "$rootfs/sys")
+            rproc=$(safe_dir "$rootfs/proc")     || crt_die "setup /proc"
+            retc=$(safe_dir "$rootfs/etc")       || crt_die "setup /etc"
+            safe_dir "$rootfs/oldroot" >/dev/null || crt_die "setup /oldroot"
+            rdev=$(safe_dir "$rootfs/dev")       || crt_die "setup /dev"
+            rpts=$(safe_dir "$rootfs/dev/pts")   || crt_die "setup /dev/pts"
+            rshm=$(safe_dir "$rootfs/dev/shm")   || crt_die "setup /dev/shm"
+            rtmp=$(safe_dir "$rootfs/tmp")       || crt_die "setup /tmp"
+            rsys=$(safe_dir "$rootfs/sys")       || crt_die "setup /sys"
 
             hreq mount --make-rprivate /
             # Make the rootfs a mount point first, so every submount below lands
@@ -669,14 +758,14 @@ RO
             # (the kernel forbids device writes on a userns-created tmpfs).
             for n in null zero full random urandom tty; do
                 [ -e "/dev/$n" ] || continue
-                dn=$(safe_file "$rdev/$n")
+                dn=$(safe_file "$rdev/$n") || crt_die "setup /dev/$n"
                 hreq mount --bind "/dev/$n" "$dn"
             done
             hreq mount -t devpts devpts "$rpts" -o newinstance,ptmxmode=0666,mode=0620
             ln -sfn pts/ptmx "$rdev/ptmx" 2>/dev/null || true
             hreq mount -t tmpfs tmpfs "$rshm"
 
-            rc=$(safe_file "$retc/resolv.conf")
+            rc=$(safe_file "$retc/resolv.conf") || crt_die "setup /etc/resolv.conf"
             mount --bind /etc/resolv.conf "$rc" 2>/dev/null || true
 
             if [ "$private_tmp" = 1 ]; then
@@ -686,7 +775,8 @@ RO
             fi
 
             if [ "$no_home" != 1 ]; then
-                htgt=$(canon "$rootfs$userhome"); mkdir -p "$htgt"
+                htgt=$(canon "$rootfs$userhome") || crt_die "resolve home target"
+                mkdir -p "$htgt" || crt_die "mkdir home target"
                 hreq mount --bind "$userhome" "$htgt"
             fi
 
@@ -699,7 +789,8 @@ RO
                     *:*:rw) spec=${spec%:rw} ;;
                 esac
                 host=${spec%%:*}; container=${spec#*:}
-                tgt=$(canon "$rootfs$container"); mkdir -p "$tgt"
+                tgt=$(canon "$rootfs$container") || crt_die "resolve mount target $container"
+                mkdir -p "$tgt" || crt_die "mkdir mount target $container"
                 req mount --rbind "$host" "$tgt"
                 if [ "$mode" = ro ]; then
                     mount -o remount,bind,ro=recursive "$tgt" 2>/dev/null \
@@ -741,8 +832,13 @@ RO
                 # The old root must be gone before the command runs. No redirect to a
                 # path inside the new root (it may not exist / be read-only), then verify.
                 umount -l /oldroot || crt_die "could not detach old root"
-                [ "$(grep -c " /oldroot" /proc/self/mountinfo)" -eq 0 ] \
-                    || crt_die "old root still mounted after pivot"
+                # Verify the old root is gone, using only bash builtins (no rootfs
+                # binary), then fail closed if any /oldroot mount remains.
+                _old=0
+                while read -r _f1 _f2 _f3 _f4 _mp _rest; do
+                    case "$_mp" in /oldroot|/oldroot/*) _old=$((_old + 1)) ;; esac
+                done < /proc/self/mountinfo
+                [ "$_old" -eq 0 ] || crt_die "old root still mounted after pivot"
                 rmdir /oldroot 2>/dev/null || true
                 if [ "$hardened" = 1 ]; then
                     # Drop all privileges via an absolute setpriv (never a PATH lookup,
@@ -812,6 +908,8 @@ cmd_rm() {
 
     echo "Removing $rootfs..."
     rm -rf "$rootfs"
+    # Remove the out-of-rootfs stored config and taint marker too.
+    rm -f "$CRT_CONF_DIR/$name" "$CRT_STATE_DIR/$name.tainted"
     echo "Removed chroot '$name'"
 }
 
@@ -1007,6 +1105,12 @@ remount, unmount, or create mounts. A minimal /dev (null, zero, full, random,
 urandom, tty, a fresh devpts, private shm) is built; the host /dev is never
 exposed. File descriptors above stderr are closed except --keep-fd entries and,
 when -e NODE_CHANNEL_FD is passed, that fd (so Node's IPC channel works).
+
+Hardened mode forces the rootfs read-only and refuses any rootfs that has been
+run writable since it was created (its umount/setpriv are trusted). Create a
+rootfs for untrusted code and only ever run it hardened; recreate it if a
+writable run tainted it. Stored config lives outside every rootfs
+(CRT_HOME/.config/<name>), so a container cannot alter its own config.
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)
