@@ -69,6 +69,21 @@ fail) and again before a cached copy is reused (mismatch: delete and
 refetch). Only `sha256:` digests are accepted. The manifest comes from the
 registry over HTTPS; its digests tie the layers to it.
 
+A digest only proves the registry sent the layer the manifest names, not that
+the layer is benign, so every layer is checked before anything is deleted or
+extracted. `_oci_check_layer` lists the layer (`tar -tv`, escape quoting) and
+refuses it if any member name or hardlink target is absolute, has a `..`
+component, needs escaping (a backslash in the listing), or has a parent path
+that runs through a symlink, whether the symlink comes from this layer or
+already exists in the rootfs from a lower layer. That last rule is the one
+tar does not enforce: GNU tar refuses `..` members, strips a leading `/`, and
+defers symlinks whose targets are absolute or contain `..` to the end of the
+archive, but it follows a symlink that a lower layer left behind. Image
+layers record files at their real paths, so ordinary images pass. Whiteout
+deletion then resolves each whiteout's parent directory with `realpath`,
+requires it inside the rootfs, and removes the leaf without following it.
+Extraction runs with `--no-same-owner`.
+
 **Config files** are line-oriented, one directive per line, unknown
 directives silently skipped for forward compatibility. `packages` (xbps
 only) is applied after `base-minimal` via `_install_packages`, and only
@@ -179,60 +194,105 @@ default `--net host` sharing of the host stack.
 
 ## Trust model
 
-A hardened run protects the host from the command. It assumes:
+**Hardened mode protects the host from the workload inside a hardened run.
+Default mode is not a sandbox.**
+
+A default (non-hardened) run has the invoking user's authority over the host.
+It binds `$HOME` and host `/tmp` read-write, keeps full capabilities in its
+user namespace, and runs the rootfs's own `umount` while the host tree is
+still attached at `/oldroot`. Code in a default run can therefore change any
+file that user can: any rootfs under `CRT_HOME`, any stored config, any
+pristine marker. `crt` does not try to protect a hardened rootfs from default
+runs, and the pristine marker cannot see such writes: it is per-rootfs, and
+code in one rootfs can modify another.
+
+The consequence: **the integrity of every hardened rootfs depends on never
+running untrusted code in default mode, in any rootfs, as the same user.**
+That includes `crt enter` and, for example, `crt run ubuntu apt install …`
+of a package you do not trust.
+
+Given that, a hardened run assumes:
 
 - **The operator's environment is trusted.** Whoever invokes `crt` can run
   anything as that user anyway. `crt` drops exported functions and resolves
   its helpers from fixed paths so an accident in that environment does not
   quietly weaken a run, but it does not defend against a hostile caller.
-  Exported functions named like the bash builtins `crt` uses to drop them
-  (`compgen`, `unset`, `builtin`, `command`, `declare`) are out of scope:
-  defeating them needs a re-exec under `env -i`, which would also drop the
-  caller environment that default runs inherit and `-e NAME` reads.
-- **The rootfs is trusted in hardened mode.** After `pivot_root` the old-root
+- **The rootfs is what `crt create` wrote.** After `pivot_root` the old-root
   detach and the capability drop run the rootfs's own `umount` and `setpriv`,
   with its own loader and libc, while still privileged and while the host
   tree is attached at `/oldroot`. Exec'ing host binaries through
   `/proc/self/fd` does not help, because a dynamic binary's loader and
   libraries still resolve from the new root. A hardened run is only as safe
-  as the rootfs is unmodified.
-- **CRT_HOME is out of every container's reach.** Rootfs trees, `.config`
-  and `.state` must not be writable from any container, hardened or not.
+  as the rootfs is unmodified. `crt create` extracts image layers under the
+  containment rules in [Create](#create), so a malicious image cannot write
+  outside its own rootfs, but its own contents are trusted.
+
+What a hardened run itself guarantees: it cannot reach `CRT_HOME`. The
+placement check and the bind check below refuse any hardened run that would
+bind `CRT_HOME`, `.config` or `.state`, whether directly, through an
+ancestor, or read-only, and the pristine rule refuses a rootfs that a default
+run has touched through `crt`.
 
 ### Pristine marker
 
 `crt create` ends by writing `$CRT_HOME/.state/<name>.pristine` holding the
 rootfs's identity, `dev:inode canonical-path`. A hardened run requires a
 regular (non-symlink) marker whose content matches the current rootfs, and
-forces the rootfs read-only. Every non-hardened run deletes the marker before
-it starts, and does not start if it cannot. A rootfs that has ever been
-writable to a container is refused for hardened use until it is recreated.
+forces the rootfs read-only. Every non-hardened run of that rootfs deletes
+its marker before it starts, and does not start if it cannot.
 
-The design fails closed: a legacy rootfs, a migrated one, a renamed or
-re-created directory, a different `CRT_HOME`, or a symlink alias never has a
-matching marker. `cmd_run` also requires `realpath(rootfs)` to equal
-`realpath(CRT_HOME)/<name>`.
+This refuses a legacy rootfs, a migrated one, a symlink alias, a rootfs
+renamed away from its name, a copy, and a different `CRT_HOME`. `cmd_run`
+also requires `realpath(rootfs)` to equal `realpath(CRT_HOME)/<name>`. It
+does not catch two operator actions that reproduce the same identity:
+
+- renaming a rootfs away, running it writable under the new name (which
+  removes only the new name's marker), then renaming it back;
+- `rm -rf` of a rootfs followed by `mkdir` of the same name, if the
+  filesystem hands out the old inode number again.
+
+In both cases the old marker matches a tree `crt create` did not write.
+Recreate a rootfs with `crt rm <name>` followed by `crt create`, which
+removes the marker first, rather than by hand.
 
 Stored config lives in `$CRT_HOME/.config/<name>`, never inside the rootfs.
 A legacy `<rootfs>/config` is moved out once, only if it is a regular file (a
 symlink or other type is refused), and the rootfs loses any marker, since its
-history is unknown.
+history is unknown. A legacy config that is a hardlink to a file outside
+`CRT_HOME` is moved as a hardlink, so the stored config keeps sharing that
+inode; the rootfs is non-pristine, so this affects only default runs.
 
-### CRT_HOME placement
+### CRT_HOME placement and hardened binds
 
 A non-hardened run can bind `$HOME`, `/tmp` and the host side of any `mount`
-line in any stored config. If `CRT_HOME` overlapped one of those, a writable
-container could edit a rootfs, its config or its marker, and a later
-hardened run would trust the result. Before every hardened run,
+line in any stored config. Before every hardened run,
 `check_crt_home_placement` compares `realpath(CRT_HOME)` with each of those
 paths (at or under, in either direction; `/` overlaps everything) and
 refuses on any overlap, telling the operator to move `CRT_HOME` outside
 `$HOME` and `/tmp`. The default `/home/crt` satisfies this. A `CRT_HOME`
-under `$HOME` or `/tmp` still works for non-hardened runs.
+under `$HOME` or `/tmp` still works for non-hardened runs. This keeps the
+common paths a default run exposes away from `CRT_HOME`; it is not a defense
+against a default run, which has the user's authority regardless (above).
 
-A `-v` flag on one non-hardened run can bind any path, `CRT_HOME` included.
-That is an operator action, like editing `CRT_HOME` by hand, and falls under
-the trusted-operator assumption.
+`check_binds_clear_of_crt` then checks the hardened run's own binds, from
+flags and from its stored config. Any bind whose host side is, contains, or
+sits inside `CRT_HOME`, `.config` or `.state` is refused, `:ro` included,
+since a read-only bind still exposes other rootfs configs. Paths are
+compared after `realpath`, and `.config` and `.state` are resolved on their
+own in case either is a symlink out of `CRT_HOME`.
+
+### Residuals
+
+- Rename-and-back and inode reuse after a manual `rm`/`mkdir` give a stale
+  pristine marker (above). Recreate with `crt rm` then `crt create`.
+- A hardlinked legacy config keeps sharing its inode after migration (above).
+- Exported functions named like the bash builtins `crt` uses to drop
+  inherited functions (`compgen`, `unset`, `builtin`, `command`, `declare`)
+  can still shadow them. Only the environment that invokes `crt` can set
+  them. Running under bash's POSIX mode, where special builtins such as
+  `unset` take precedence over functions, or re-executing under `env -i`
+  with an allow-list, would close it; `crt` does neither, because the
+  invoking environment is trusted.
 
 ## Resource limits (cgroups)
 
@@ -279,5 +339,13 @@ root is actually gone, the capability drop actually blocks remount/
 unmount/new-mount, the minimal `/dev` has no block or input devices, a
 `:ro` bind actually rejects writes, a planted `resolv.conf`/`/dev` symlink
 is not followed, a rootfs that was run writable or has legacy config is
-refused for hardened use, and a default (non-hardened) run is unchanged. It
+refused for hardened use, a hardened run cannot bind `CRT_HOME` (rw, ro, or
+through an ancestor), and a default (non-hardened) run is unchanged.
+
+The OCI containment rules are tested in the mock suite with crafted layers
+(`test/mklayer.py`, needs python3): `..` and absolute members, whiteouts and
+hardlinks with `..`, and files, hardlinks and whiteouts through a symlink
+created in the same layer or a lower one. Each must fail the create and
+leave a file outside the rootfs untouched; a benign layered image with
+whiteouts and symlinks must still unpack. It
 self-skips when unprivileged user namespaces aren't available on the host.

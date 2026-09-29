@@ -12,6 +12,32 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+# CRT_MOCK_LAYERS="a.tgz b.tgz": serve an image made of these layer files, in
+# order, with a manifest listing their real sha256 digests.
+if [ -n "$CRT_MOCK_LAYERS" ]; then
+    case "$url" in
+        *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
+        */manifests/*)
+            printf '{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","layers":['
+            sep=""
+            for f in $CRT_MOCK_LAYERS; do
+                printf '%s{"digest":"sha256:%s"}' "$sep" "$(sha256sum "$f" | cut -d' ' -f1)"
+                sep=","
+            done
+            printf ']}\n' ;;
+        */blobs/*)
+            want="${url##*/blobs/}"
+            for f in $CRT_MOCK_LAYERS; do
+                if [ "sha256:$(sha256sum "$f" | cut -d' ' -f1)" = "$want" ]; then
+                    if [ -n "$outfile" ]; then cp "$f" "$outfile"; else cat "$f"; fi
+                    exit 0
+                fi
+            done
+            exit 22 ;;
+        *) printf 'mock-curl: unhandled url: %s\n' "$url" >&2; exit 1 ;;
+    esac
+    exit 0
+fi
 case "$url" in
     *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
     */manifests/*) cat "$FIXTURES/manifest.json" ;;

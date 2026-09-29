@@ -230,6 +230,22 @@ check "pristine: a legacy rootfs with no marker is refused for hardened use" "re
 check "pristine: its legacy config was migrated out of the rootfs" "yes" \
     "$([ -f "$CRT_HOME/.config/legacyr" ] && [ ! -e "$CRT_HOME/legacyr/config" ] && echo yes || echo no)"
 
+# ── P9: a hardened run may not bind CRT_HOME (rw or ro, or an ancestor) ───────
+cfg_before="$(cat "$CRT_HOME/.config/iso")"
+for label in rw ro ancestor; do
+    case "$label" in
+        rw)       spec="$CRT_HOME:/crth" ;;
+        ro)       spec="$CRT_HOME:/crth:ro" ;;
+        ancestor) spec="$(dirname "$CRT_HOME"):/vt" ;;
+    esac
+    if errb=$("$CRT" run --clean-env --no-home "${USR_RO[@]}" -v "$spec" iso \
+            /bin/sh -c 'echo POISON > /crth/iso/POISON 2>/dev/null; echo ran' 2>&1); then br=ran
+    elif printf '%s' "$errb" | grep -q "overlaps"; then br=refused; else br="other: $errb"; fi
+    check "P9: hardened $label bind of CRT_HOME is refused" "refused" "$br"
+done
+check "P9: the refused runs changed nothing in the rootfs or its config" "yes" \
+    "$([ ! -e "$CRT_HOME/iso/POISON" ] && [ "$(cat "$CRT_HOME/.config/iso")" = "$cfg_before" ] && echo yes || echo no)"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ]

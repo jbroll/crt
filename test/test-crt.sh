@@ -414,6 +414,67 @@ fetches=$(wc -l < "$CURL_LOG"); rm -f "$CURL_LOG"
 if [ "$fetches" = 1 ] && [ -f "$CRT_HOME/refetch/bin/sh" ] \
    && sha256sum "$CRT_HOME/.cache/layers/$DIGEST_FILE" | grep -q '^6a798081'; then Pass; else Fail; fi
 
+# ── OCI: crafted layers must not reach outside the rootfs ─────────────────────
+echo "# OCI layer containment"
+
+if command -v python3 >/dev/null 2>&1; then
+    MKL="$SCRIPT_DIR/mklayer.py"
+    LAY=$(mktemp -d -p /var/tmp crt-lay.XXXXXX)
+    # OUT is a sibling of CRT_HOME, so from a rootfs it is ../../<OUT basename>.
+    OUT=$(mktemp -d -p "$(dirname "$CRT_HOME")" crt-out.XXXXXX)
+    REL="../../$(basename "$OUT")"
+
+    # oci_escape_test NAME DESC LAYER...: create must fail, the rootfs must be
+    # gone, and OUT must still hold exactly its 'victim' file.
+    oci_escape_test() {
+        local name="$1" desc="$2"; shift 2
+        Test "OCI: $desc is refused"
+        printf 'victim\n' > "$OUT/victim"
+        CRT_MOCK_LAYERS="$*" "$CRT" create "$name" alpine:3.19 >/dev/null 2>&1
+        local rc=$? left
+        left=$(find "$OUT" -mindepth 1 | wc -l)
+        if [ "$rc" -ne 0 ] && [ ! -e "$CRT_HOME/$name" ] && [ -f "$OUT/victim" ] \
+           && [ "$left" = 1 ]; then Pass; else Fail; fi
+    }
+
+    python3 "$MKL" "$LAY/wh.tgz" "f:$REL/.wh.victim"
+    oci_escape_test ociwh "a whiteout with '..' (would delete a host file)" "$LAY/wh.tgz"
+
+    python3 "$MKL" "$LAY/dotdot.tgz" "f:ok" "f:$REL/dotdot"
+    oci_escape_test ocidd "a '..' member" "$LAY/dotdot.tgz"
+
+    python3 "$MKL" "$LAY/abs.tgz" "f:$OUT/abs"
+    oci_escape_test ociabs "an absolute member" "$LAY/abs.tgz"
+
+    python3 "$MKL" "$LAY/symfile.tgz" "l:lnk:$OUT" "f:lnk/pwn"
+    oci_escape_test ocisf "a file through a symlink made in the same layer" "$LAY/symfile.tgz"
+
+    python3 "$MKL" "$LAY/l1.tgz" "l:lnk:$OUT"
+    python3 "$MKL" "$LAY/l2.tgz" "f:lnk/pwn"
+    oci_escape_test ocixl "a file through a symlink from a lower layer" "$LAY/l1.tgz" "$LAY/l2.tgz"
+
+    python3 "$MKL" "$LAY/h2.tgz" "h:hl:lnk/victim"
+    oci_escape_test ocihl "a hardlink through a symlink from a lower layer" "$LAY/l1.tgz" "$LAY/h2.tgz"
+
+    python3 "$MKL" "$LAY/w2.tgz" "f:lnk/.wh.victim"
+    oci_escape_test ociws "a whiteout through a symlink from a lower layer" "$LAY/l1.tgz" "$LAY/w2.tgz"
+
+    python3 "$MKL" "$LAY/hdd.tgz" "f:a" "h:hl:$REL/victim"
+    oci_escape_test ocihd "a hardlink target with '..'" "$LAY/hdd.tgz"
+
+    Test "OCI: a benign layered image with whiteouts and symlinks still unpacks"
+    python3 "$MKL" "$LAY/b1.tgz" "d:a" "f:a/old" "d:usr" "d:usr/bin" "f:usr/bin/sh" "l:bin:usr/bin"
+    python3 "$MKL" "$LAY/b2.tgz" "f:a/.wh.old" "f:usr/bin/new" "l:link2:/usr/bin/new"
+    CRT_MOCK_LAYERS="$LAY/b1.tgz $LAY/b2.tgz" "$CRT" create ocibenign alpine:3.19 >/dev/null 2>&1
+    R="$CRT_HOME/ocibenign"
+    if [ -f "$R/usr/bin/new" ] && [ ! -e "$R/a/old" ] && [ -L "$R/bin" ] \
+       && [ -L "$R/link2" ] && [ -z "$(find "$R" -name '.wh.*')" ]; then Pass; else Fail; fi
+
+    rm -rf "$LAY" "$OUT"
+else
+    echo "# (python3 not found: skipping crafted OCI layer tests)"
+fi
+
 # ── cmd_export ────────────────────────────────────────────────────────────────
 echo "# cmd_export"
 
@@ -809,6 +870,43 @@ th=$(mktemp -d -p /tmp crt-home.XXXXXX)
 CRT_HOME="$th" make_rootfs tenv
 out=$(CRT_HOME="$th" "$CRT" run tenv sh -c 'echo ok' 2>/dev/null)
 rm -rf "$th"
+CompareArgs "$out" "ok"
+
+# ── hardened binds may not touch CRT_HOME, .config or .state (P9) ─────────────
+echo "# hardened binds clear of CRT_HOME"
+
+# bind_refused DESC SPEC: a hardened run with this -v must be refused.
+bind_refused() {
+    Test "run: hardened bind of $1 is refused"
+    local err
+    err=$(crt_run --clean-env -v "$2" isoenv true 2>&1 || true)
+    if echo "$err" | grep -q "overlaps"; then Pass; else Fail; fi
+}
+bind_refused "CRT_HOME read-only" "$CRT_HOME:/crth:ro"
+bind_refused "CRT_HOME read-write" "$CRT_HOME:/crth"
+bind_refused "an ancestor of CRT_HOME" "$(dirname "$CRT_HOME"):/vt:ro"
+bind_refused "the .state dir" "$CRT_HOME/.state:/s:ro"
+bind_refused "a directory inside .config" "$CRT_HOME/.config:/c:ro"
+bind_refused "its own rootfs" "$CRT_HOME/isoenv:/self"
+ln -sfn "$CRT_HOME/isoenv" "$CRT_HOME.alias"
+bind_refused "a symlink that resolves into CRT_HOME" "$CRT_HOME.alias:/a:ro"
+rm -f "$CRT_HOME.alias"
+
+Test "run: a hardened bind of a sibling that only shares a name prefix is allowed"
+sib="$CRT_HOME-sibling"; mkdir -p "$sib"
+out=$(crt_run --clean-env -v "$sib:/sib:ro" isoenv sh -c 'echo ok' 2>/dev/null)
+rmdir "$sib"
+CompareArgs "$out" "ok"
+
+Test "run: a hardened run is refused when its own config binds CRT_HOME"
+printf 'mount %s:/crth:ro\n' "$CRT_HOME" > "$(conf isoenv)"
+err=$(crt_run --clean-env isoenv true 2>&1 || true)
+printf '' > "$(conf isoenv)"
+if echo "$err" | grep -q "overlaps"; then Pass; else Fail; fi
+
+Test "run: a default (non-hardened) run may still bind CRT_HOME"
+# rw bind: any :ro bind would itself make the run hardened.
+out=$(crt_run -v "$CRT_HOME:/crth" isoenv sh -c 'echo ok' 2>/dev/null)
 CompareArgs "$out" "ok"
 
 # ── stored config lives outside the rootfs (New-6) ────────────────────────────

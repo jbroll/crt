@@ -123,6 +123,33 @@ check_crt_home_placement() {  # canonical CRT_HOME
     done
 }
 
+# A hardened run must not bind CRT_HOME, its config dir or its state dir, nor any
+# directory that contains or sits inside them: rw would let the command rewrite
+# a rootfs, config or marker, and ro would still expose configs. Paths are
+# compared canonically (the state/config dirs are resolved on their own in case
+# either is a symlink out of CRT_HOME).
+check_binds_clear_of_crt() {  # home_real spec...
+    local home_real="$1"; shift
+    local -a guarded=("$home_real")
+    local p spec src sp g
+    for p in "$CRT_CONF_DIR" "$CRT_STATE_DIR"; do
+        sp=$(realpath -m -- "$p" 2>/dev/null) && guarded+=("$sp")
+    done
+    for spec in "$@"; do
+        src=${spec%%:*}
+        sp=$(realpath -m -- "$src" 2>/dev/null) \
+            || { echo "Error: cannot resolve mount source $src" >&2; return 1; }
+        for g in "${guarded[@]}"; do
+            if _paths_overlap "$sp" "$g"; then
+                echo "Error: mount source $src ($sp) overlaps $g." >&2
+                echo "  A hardened run may not bind CRT_HOME, its .config or .state," >&2
+                echo "  or any directory containing them, read-write or read-only." >&2
+                return 1
+            fi
+        done
+    done
+}
+
 # This repo's own test/mocks dir, resolved from the script's real location. It
 # is the only directory CRT_TEST_MODE may name; an installed crt has none.
 crt_mocks_dir() {
@@ -258,6 +285,8 @@ oci_unpack() {
     local manifest="$4"
     local rootfs="$5"
     local api_base="https://${registry}/v2/${repo}"
+    local rootfs_real
+    rootfs_real=$(realpath -e -- "$rootfs") || return 1
 
     local layers
     layers=$(echo "$manifest" | jq -r '.layers[].digest')
@@ -302,28 +331,113 @@ oci_unpack() {
             mv "$blob_tmp" "$blob"
         fi
 
+        # Refuse a layer that could write, link or delete outside the rootfs
+        # before touching anything. The digest only proves the registry sent
+        # this layer, not that the layer is benign.
+        _oci_check_layer "$rootfs_real" "$blob" || {
+            echo "Error: layer ${digest:7:12} has a member that would escape the rootfs" >&2
+            return 1
+        }
+
         # Apply whiteouts from this layer's tar listing BEFORE extracting,
         # so we only delete lower-layer content, not the current layer's files.
+        # The parent directory is resolved and must stay inside the rootfs; the
+        # leaf itself is removed without following it.
+        local wh_path wh_dir wh_name wh_parent
         while IFS= read -r wh_path; do
             wh_path="${wh_path#./}"
-            local wh_dir wh_name target
-            wh_dir="$(dirname "$wh_path")"
-            wh_name="$(basename "$wh_path")"
-            target="$rootfs/$wh_dir"
+            wh_dir="$(dirname -- "$wh_path")"
+            wh_name="$(basename -- "$wh_path")"
+            case "$wh_name" in .wh.*) ;; *) continue ;; esac
+            wh_parent=$(realpath -m -- "$rootfs_real/$wh_dir") || return 1
+            case "$wh_parent" in
+                "$rootfs_real"|"$rootfs_real"/*) ;;
+                *) echo "Error: whiteout $wh_path escapes the rootfs" >&2; return 1 ;;
+            esac
             if [ "$wh_name" = ".wh..wh..opq" ]; then
-                find "${target:?}" -mindepth 1 -delete 2>/dev/null || true
+                if [ -d "$wh_parent" ] && [ ! -L "$wh_parent" ]; then
+                    find "$wh_parent" -mindepth 1 -delete 2>/dev/null || true
+                fi
             else
-                rm -rf "${target:?}/${wh_name#.wh.}"
+                rm -rf -- "${wh_parent:?}/${wh_name#.wh.}"
             fi
-        done < <(tar -tzf "$blob" 2>/dev/null | grep '\.wh\.' || true)
+        done < <(tar --quoting-style=escape -tzf "$blob" 2>/dev/null | grep '\.wh\.' || true)
 
-        # Extract layer; remove whiteout markers (they've been applied above)
-        tar -xzf "$blob" -C "$rootfs" 2>/dev/null || {
+        # Extract. GNU tar also refuses '..' members, strips a leading '/', and
+        # defers symlinks whose target is absolute or contains '..' until the
+        # end of the archive; the pre-check above does not rely on any of that.
+        tar --no-same-owner -xzf "$blob" -C "$rootfs_real" 2>/dev/null || {
             echo "Error: failed to unpack layer ${digest:7:12}" >&2
             return 1
         }
-        find "$rootfs" -name '.wh.*' -delete
+        find "$rootfs_real" -name '.wh.*' -delete
     done
+}
+
+# _oci_check_layer ROOTFS BLOB — succeed only if extracting BLOB into ROOTFS
+# cannot create, link or delete anything outside ROOTFS. Refuses member names
+# and hardlink targets that are absolute, contain a '..' component, or need
+# escaping in tar's listing, and any whose parent path runs through a symlink:
+# one already in ROOTFS from a lower layer, or one this layer creates. Image
+# layers record files at their real paths, so ordinary builds are unaffected.
+_oci_check_layer() {
+    local rootfs="$1" blob="$2"
+    local listing line kind rest name tgt i
+    local -a names=() kinds=() targets=()
+    local -A lsym=() islink=()
+
+    listing=$(tar --numeric-owner --full-time --quoting-style=escape -tvzf "$blob") || return 1
+    local re='^(.)[^ ]* +[^ ]+ +[^ ]+ +[0-9-]+ +[0-9:]+ (.*)$'
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [[ "$line" =~ $re ]] || { echo "  unparsable tar entry: $line" >&2; return 1; }
+        kind="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"; tgt=""
+        case "$kind" in
+            l) name="${rest%% -> *}" ;;
+            h) name="${rest%% link to *}"; tgt="${rest#* link to }" ;;
+            *) name="$rest" ;;
+        esac
+        name="${name#./}"; name="${name%/}"; tgt="${tgt#./}"
+        names+=("$name"); kinds+=("$kind"); targets+=("$tgt")
+        if [ "$kind" = l ]; then lsym["$name"]=1; fi
+    done <<< "$listing"
+
+    for (( i = 0; i < ${#names[@]}; i++ )); do
+        if [ -z "${names[i]}" ] || [ "${names[i]}" = . ]; then continue; fi
+        _layer_path_ok "${names[i]}" || return 1
+        if [ "${kinds[i]}" = h ]; then _layer_path_ok "${targets[i]}" || return 1; fi
+    done
+    return 0
+}
+
+# _layer_path_ok P — used by _oci_check_layer (reads its rootfs, lsym and
+# islink through bash dynamic scope). P must be relative, free of '..' and of
+# tar escapes, and no proper prefix of it may be a symlink.
+_layer_path_ok() {
+    local p="$1" pre="" comp i n
+    case "$p" in
+        /*|*\\*) echo "  refused: $p" >&2; return 1 ;;
+    esac
+    local -a parts
+    IFS=/ read -ra parts <<< "$p"
+    n=${#parts[@]}
+    for (( i = 0; i < n; i++ )); do
+        comp="${parts[i]}"
+        if [ "$comp" = .. ]; then echo "  refused '..' in: $p" >&2; return 1; fi
+        if [ -z "$comp" ] || [ "$comp" = . ]; then continue; fi
+        pre="${pre:+$pre/}$comp"
+        (( i == n - 1 )) && break
+        if [ -n "${lsym[$pre]:-}" ]; then
+            echo "  refused path through symlink $pre: $p" >&2; return 1
+        fi
+        if [ -z "${islink[$pre]:-}" ]; then
+            if [ -L "$rootfs/$pre" ]; then islink["$pre"]=1; else islink["$pre"]=0; fi
+        fi
+        if [ "${islink[$pre]}" = 1 ]; then
+            echo "  refused path through symlink $pre: $p" >&2; return 1
+        fi
+    done
+    return 0
 }
 
 parse_memory() {
@@ -773,6 +887,7 @@ cmd_run() {
             exit 1
         fi
         check_crt_home_placement "$home_real" || exit 1
+        check_binds_clear_of_crt "$home_real" "${all_mounts[@]}" || exit 1
     else
         clear_pristine "$name" \
             || { echo "Error: cannot remove the pristine marker for '$name'; not starting." >&2; exit 1; }
@@ -1272,14 +1387,20 @@ urandom, tty, a fresh devpts, private shm) is built; the host /dev is never
 exposed. File descriptors above stderr are closed except --keep-fd entries and,
 when -e NODE_CHANNEL_FD is passed, that fd (so Node's IPC channel works).
 
+Hardened mode protects the host from the workload in a hardened run. Default
+mode is NOT a sandbox: a default run has your authority over the host and can
+change any rootfs, config or marker under CRT_HOME. Never run untrusted code in
+default mode, in any rootfs; every hardened rootfs depends on that.
+
 Hardened mode trusts the rootfs's own umount/setpriv, so it runs only on a
 pristine rootfs: crt create writes a marker (CRT_HOME/.state/<name>.pristine,
 keyed on the rootfs's path and inode), any non-hardened run deletes it, and a
-hardened run requires it and forces the rootfs read-only. Create a rootfs for
-untrusted code and only ever run it hardened. Stored config lives outside every
+hardened run requires it and forces the rootfs read-only. Recreate a rootfs
+with crt rm then crt create, never by hand. Stored config lives outside every
 rootfs (CRT_HOME/.config/<name>). CRT_HOME must be outside $HOME, /tmp and any
-mount source in a stored config (the default /home/crt is), or hardened runs
-are refused. Names: letters, digits, '.', '_', '-', starting alphanumeric.
+mount source in a stored config (the default /home/crt is), and a hardened run
+may not bind CRT_HOME, .config or .state (rw or ro), or it is refused.
+Names: letters, digits, '.', '_', '-', starting alphanumeric.
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)
