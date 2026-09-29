@@ -8,9 +8,11 @@ MOCKS="$SCRIPT_DIR/mocks"
 export PATH="$MOCKS:$PATH"
 
 # The mocks provide no real mount namespace, so the mock pivot_root always fails.
-# CRT_TEST_MODE lets cmd_run fall back to chroot (and skip ro verification) instead
-# of aborting. It is a test-only switch; real runs never set it.
-export CRT_TEST_MODE=1
+# Test mode lets cmd_run resolve its binaries from the mocks, fall back to chroot,
+# and skip ro verification. It is enabled only when CRT_TEST_MODE names a directory
+# carrying the mocks' marker file (test/mocks/.crt-mocks) — a bare CRT_TEST_MODE=1
+# from a normal caller does nothing. Real runs never point it at a mocks dir.
+export CRT_TEST_MODE="$MOCKS"
 
 . "$SCRIPT_DIR/Test"
 
@@ -615,6 +617,18 @@ Test "run: -e NODE_CHANNEL_FD keeps that fd open automatically"
 result=$(NODE_CHANNEL_FD=3 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&3' 3<<<'ipc-msg' 2>/dev/null)
 CompareArgs "$result" "ipc-msg"
 
+Test "run: NODE_CHANNEL_FD naming an unopened fd is not kept (New-4)"
+result=$(NODE_CHANNEL_FD=9 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&9 2>/dev/null && echo LEAK || echo closed' 2>/dev/null)
+CompareArgs "$result" "closed"
+
+Test "run: NODE_CHANNEL_FD <= 2 is not auto-kept and does not error (New-4)"
+result=$(NODE_CHANNEL_FD=1 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
+CompareArgs "$result" "ok"
+
+Test "run: NODE_CHANNEL_FD non-numeric does not trip fd validation (New-4)"
+result=$(NODE_CHANNEL_FD=notanfd "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
+CompareArgs "$result" "ok"
+
 Test "run: keep-fd directive from config keeps the fd open"
 printf 'keep-fd 3\n' > "$CRT_HOME/isoenv/config"
 result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'cfg-fd' 2>/dev/null)
@@ -635,5 +649,24 @@ CompareArgs "$(read_cfg_field 'keep-fd 3
 Test "read_config: keep-fd multiple"
 CompareArgs "$(read_cfg_field 'keep-fd 3 4 5
 ' 'echo "${#config_keepfds[@]}"')" "3"
+
+# ── test-mode gate (New-2) ────────────────────────────────────────────────────
+echo "# test-mode gate"
+
+Test "run: a bare CRT_TEST_MODE value does not select the mocks (New-2)"
+# With CRT_TEST_MODE=1 (no marker dir) crt must NOT resolve unshare from the mocks,
+# so the mock unshare never runs and logs nothing. (It then attempts a real
+# namespace and, on this rootfs, fails — that is fine; we only check the mock was
+# not selected, i.e. an inherited env value cannot arm test mode.)
+loggate=$(mktemp)
+CRT_TEST_MODE=1 CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true
+if grep -q '^unshare ' "$loggate"; then Fail; else Pass; fi
+rm -f "$loggate"
+
+Test "run: the marker-gated CRT_TEST_MODE does select the mocks"
+loggate=$(mktemp)
+CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true
+if grep -q '^unshare ' "$loggate"; then Pass; else Fail; fi
+rm -f "$loggate"
 
 TestDone

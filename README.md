@@ -43,6 +43,17 @@ Any isolation option (`--net none`, `--no-home`, `--tmp private`, a `:ro` bind,
 - **Read-only binds verified.** A `:ro` bind is remounted read-only (recursively
   where the kernel supports it) and then checked with `findmnt`; a still-writable
   mount or submount aborts the run.
+- **Trusted binaries, clean env.** `crt` resolves every helper it runs
+  (`unshare`, and inside the namespace `mount`, `pivot_root`, `umount`,
+  `findmnt`, `realpath`, `setpriv`, …) by absolute path from a fixed trusted
+  `PATH`, never the caller's, and `setpriv` is exec'd absolutely. `-e`/`env`
+  values are never exported into `crt` itself — they are applied to the command
+  only — so a caller-supplied `PATH`/`LD_PRELOAD` cannot hijack `crt`.
+- **Symlink-safe setup.** Every path `crt` writes or mounts before `pivot_root`
+  (`/dev/*`, `/etc/resolv.conf`, `/proc`, `/tmp`, the bind targets) is resolved
+  with `realpath` and refused if it escapes the rootfs; a symlink planted at a
+  leaf (e.g. `/etc/resolv.conf`) is removed rather than followed. A poisoned
+  rootfs from an earlier run cannot redirect setup to a host path.
 
 Without any isolation option, `crt run` behaves as before: the command runs as
 root with capabilities, so `crt run ubuntu apt install -y perl` still works.
@@ -51,9 +62,10 @@ root with capabilities, so `crt run ubuntu apt install -y perl` still works.
 
 File descriptors above stderr are closed before the command runs, except those
 named with `--keep-fd N` (repeatable) and — when `-e NODE_CHANNEL_FD` is passed
-— the fd named by `NODE_CHANNEL_FD`. This lets a parent hand the command an IPC
-channel, e.g. Node's `fork()`/`spawn(..., {stdio: [...,'ipc']})`, while a fd the
-caller leaked without `O_CLOEXEC` does not become a handle outside the sandbox.
+— the fd named by `NODE_CHANNEL_FD`, but only if it is actually open and above
+stderr. This lets a parent hand the command an IPC channel, e.g. Node's
+`fork()`/`spawn(..., {stdio: [...,'ipc']})`, while a fd the caller leaked without
+`O_CLOEXEC` does not become a handle outside the sandbox.
 
 ## Installation
 
@@ -259,22 +271,26 @@ bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
 | Mock | Replaces | What it does |
 |---|---|---|
 | `unshare` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), strips namespace flags, runs the inner script on the host |
-| `pivot_root` | util-linux | Always fails, so with `CRT_TEST_MODE=1` `cmd_run` falls back to `chroot` (no real mount namespace under test) |
+| `pivot_root` | util-linux | Always fails, so in test mode `cmd_run` falls back to `chroot` (no real mount namespace under test) |
 | `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
 | `mount` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), then no-op |
 | `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
 | `xbps-install` | xbps | Creates a minimal `bin/sh` skeleton in the rootfs |
 
-`test/test-crt.sh` exports `CRT_TEST_MODE=1`, a test-only switch that lets
-`cmd_run` fall back to `chroot` (and skip read-only verification) when the mock
-`pivot_root` fails, instead of aborting. Real runs never set it. This lets the
-full `cmd_create` and `cmd_run` code paths run without root, namespaces,
-network, or xbps. 96 tests cover `parse_memory`, `read_config` (including the
+`test/test-crt.sh` sets `CRT_TEST_MODE` to the mocks directory, which carries a
+marker file (`test/mocks/.crt-mocks`). Test mode is enabled only when
+`CRT_TEST_MODE` names such a directory: it routes `crt`'s binary resolution
+through the mocks, lets `cmd_run` fall back to `chroot`, and skips read-only
+verification when the mock `pivot_root` fails. A bare `CRT_TEST_MODE=1` inherited
+by a production run does nothing. This lets the full `cmd_create` and `cmd_run`
+code paths run without root, namespaces, network, or xbps. 101 tests cover
+`parse_memory`, `read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
 `write_config`, `parse_image_ref`, all three `create` dispatch paths, `run` flag
 and config merging, the generated `unshare`/`mount` calls for each isolation
-flag, clean-env behavior, `--keep-fd` and fd closing, `list`, `rm`, OCI layer
-cache reuse, `export`, and `setup`.
+flag, clean-env behavior, `--keep-fd`/fd closing and the `NODE_CHANNEL_FD`
+guards, the marker-gated test-mode switch, `list`, `rm`, OCI layer cache reuse,
+`export`, and `setup`.
 
 `test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
 (bind-mounted read-only) and proves, in real namespaces, mostly from one run
@@ -285,7 +301,10 @@ is capless (cannot remount, unmount, or create mounts), `$HOME` and the host
 `/dev/null`, `:ro` binds reject writes, the clean environment is minimal, a kept
 fd is readable while an unlisted one is closed, `NODE_CHANNEL_FD` is kept
 automatically, `--net none` blocks the network, and a default run is unchanged
-(uid 0 with capabilities, `$HOME` visible). 23 checks.
+(uid 0 with capabilities, `$HOME` visible). It also checks that an `-e PATH`
+cannot substitute `crt`'s `unshare`, that a PATH-planted `setpriv` is not used
+(caps still dropped), and that planted `resolv.conf`/`/dev` symlinks in the
+rootfs are not followed. 29 checks.
 
 ## Limitations
 

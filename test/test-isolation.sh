@@ -135,6 +135,52 @@ else
     ok "default: \$HOME canary unwritable, skipped"
 fi
 
+# ── New-1: an -e PATH cannot substitute crt's own unshare ─────────────────────
+# A fake `unshare` earlier on PATH must never run (it would run on the host,
+# unsandboxed). crt resolves unshare from a trusted path and never exports -e.
+FAKE="$WORK/fakebin"; mkdir -p "$FAKE"
+printf '#!/bin/sh\ntouch "%s/UNSHARE_PWNED"\n' "$WORK" > "$FAKE/unshare"; chmod +x "$FAKE/unshare"
+rm -f "$WORK/UNSHARE_PWNED"
+PATH="$FAKE:$PATH" "$CRT" run --no-home -e "PATH=$FAKE" "${USR_RW[@]}" "$NAME" /bin/true 2>/dev/null || true
+[ -e "$WORK/UNSHARE_PWNED" ] && r=ran || r=safe
+check "New-1: -e PATH cannot substitute crt's unshare" "safe" "$r"
+
+# ── New-3: setpriv is resolved absolutely; a PATH-planted one is not used ──────
+# Poison the caller PATH and -e PATH with a fake setpriv that would NOT drop caps.
+# The hardened run must still be capless (real /usr/bin/setpriv), and the fake
+# must not have executed.
+printf '#!/bin/sh\ntouch "%s/SETPRIV_PWNED"\nexec "$@"\n' "$WORK" > "$FAKE/setpriv"; chmod +x "$FAKE/setpriv"
+rm -f "$WORK/SETPRIV_PWNED"
+cap="$(PATH="$FAKE:$PATH" "$CRT" run --clean-env --no-home --ro-root -e "PATH=$FAKE:/usr/bin:/bin" \
+        "${USR_RO[@]}" "$NAME" /bin/sh -c 'awk "/^CapEff/{print \$2}" /proc/self/status' 2>/dev/null)"
+check "New-3: caps dropped despite a PATH-planted setpriv" "0000000000000000" "$cap"
+[ -e "$WORK/SETPRIV_PWNED" ] && s=ran || s=safe
+check "New-3: the PATH-planted setpriv did not run" "safe" "$s"
+
+# ── finding 7: pre-pivot setup must not follow symlinks planted in the rootfs ──
+# 7a: a planted /etc/resolv.conf symlink to an outside file must not be followed
+# (the outside file must keep its contents; crt removes the leaf link).
+P7="$CRT_HOME/poison7a"
+mkdir -p "$P7"/{etc,proc,dev,tmp,usr/bin,usr/lib}
+for d in bin lib lib64 sbin; do t="$(readlink "/$d")" && ln -s "$t" "$P7/$d"; done
+printf 'image void\n' > "$P7/config"
+OUTSIDE="$WORK/outside_secret"; echo keep-me > "$OUTSIDE"
+ln -sf "$OUTSIDE" "$P7/etc/resolv.conf"
+"$CRT" run --no-home "${USR_RO[@]}" poison7a /bin/true 2>/dev/null || true
+check "finding7: planted resolv.conf symlink did not truncate outside file" "keep-me" "$(cat "$OUTSIDE" 2>/dev/null)"
+
+# 7b: a planted /dev symlink to an outside directory must be refused (abort),
+# and no device placeholder may be created in that outside directory.
+P7B="$CRT_HOME/poison7b"
+mkdir -p "$P7B"/{etc,proc,tmp,usr/bin,usr/lib}
+for d in bin lib lib64 sbin; do t="$(readlink "/$d")" && ln -s "$t" "$P7B/$d"; done
+printf 'image void\n' > "$P7B/config"
+OUTDEV="$WORK/outside_dev"; mkdir -p "$OUTDEV"
+ln -sf "$OUTDEV" "$P7B/dev"
+if "$CRT" run --no-home "${USR_RO[@]}" poison7b /bin/true 2>/dev/null; then rc7=ran; else rc7=aborted; fi
+check "finding7: planted /dev symlink aborts the run" "aborted" "$rc7"
+check "finding7: no device node created in the outside dir" "0" "$(find "$OUTDEV" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ]

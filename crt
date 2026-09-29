@@ -521,10 +521,34 @@ cmd_run() {
         case "$spec" in *:*:ro) hardened=1 ;; esac
     done
 
+    # Trusted binary path. crt resolves the host-side helpers it runs (unshare,
+    # and inside the namespace mount/pivot_root/setpriv/...) from this fixed path,
+    # never the caller's PATH, so an -e/config PATH cannot substitute them.
+    local crt_trusted="/usr/bin:/bin:/usr/sbin:/sbin"
+    local crt_binpath="$crt_trusted"
+
+    # Test mode is enabled only when CRT_TEST_MODE names a directory carrying the
+    # mocks' marker file. A bare CRT_TEST_MODE=1, or any value inherited from the
+    # environment that is not the real mocks dir, does nothing. It routes binary
+    # resolution through the mocks, allows the chroot fallback, and skips the
+    # findmnt-based ro verification (there is no real mount namespace under test).
+    local crt_test=0
+    if [ -n "${CRT_TEST_MODE:-}" ] && [ -f "${CRT_TEST_MODE}/.crt-mocks" ]; then
+        crt_test=1
+        crt_binpath="${CRT_TEST_MODE}:$crt_trusted"
+    fi
+
+    local UNSHARE
+    UNSHARE=$(PATH="$crt_binpath" command -v unshare) \
+        || { echo "Error: unshare not found on trusted PATH" >&2; exit 1; }
+
     # Resolve env entries in the parent, where the caller's environment is visible.
     #   NAME=value  -> passed through as-is
     #   NAME        -> substituted with the caller's current value (skipped if unset)
-    # A passed-through NODE_CHANNEL_FD value is also kept open (see keep-fd below).
+    # These are never exported into the crt process itself; they are passed to the
+    # namespace and applied to the command only (via env / env -i in the payload),
+    # so an -e value cannot influence crt's own binary lookup or behavior.
+    # A passed-through NODE_CHANNEL_FD is auto-kept only if it names an open fd > 2.
     local -a resolved_envs=()
     local env_spec name value
     for env_spec in "${all_envs[@]}"; do
@@ -536,7 +560,8 @@ cmd_run() {
             echo "Warning: -e $env_spec: not set in environment, skipping" >&2
             continue
         fi
-        if [ "$name" = NODE_CHANNEL_FD ] && [[ "$value" =~ ^[0-9]+$ ]]; then
+        if [ "$name" = NODE_CHANNEL_FD ] && [[ "$value" =~ ^[0-9]+$ ]] \
+           && [ "$value" -gt 2 ] && [ -e "/proc/self/fd/$value" ]; then
             all_keepfds+=("$value")
         fi
     done
@@ -554,14 +579,6 @@ cmd_run() {
     local minpath="/usr/bin:/bin:/usr/local/bin"
     local minhome="/tmp"
 
-    if [ "$clean_env" = 0 ]; then
-        # Inherit: export resolved vars so the command sees them, no positional pass.
-        local e
-        # shellcheck disable=SC2163  # each entry is a NAME=value assignment, not a var name
-        for e in "${resolved_envs[@]}"; do export "$e"; done
-        resolved_envs=()
-    fi
-
     # Apply cgroup limits before exec
     _CRT_CGROUP=""
     apply_cgroup "$memory" "$cpus"
@@ -576,23 +593,40 @@ cmd_run() {
     unshare_args+=(-f)
 
     # shellcheck disable=SC2016
-    unshare "${unshare_args[@]}" \
+    "$UNSHARE" "${unshare_args[@]}" \
         /bin/bash -c '
             set +e
             rootfs=$1; userhome=$2; workdir=$3
             no_home=$4; private_tmp=$5; net_none=$6; ro_root=$7; clean_env=$8
             hardened=$9; shift 9
-            minpath=$1; minhome=$2; keepfds=$3; nmounts=$4; shift 4
+            crt_test=$1; binpath=$2; minpath=$3; minhome=$4; keepfds=$5; nmounts=$6; shift 6
+
+            # Fixed, trusted PATH for every helper crt runs in here (mount, pivot_root,
+            # umount, findmnt, realpath, setpriv, ...), so an -e/config PATH cannot
+            # substitute them. In test mode this leads with the mocks dir.
+            export PATH="$binpath"
 
             crt_die() { echo "crt: $1" >&2; exit 1; }
             # req: always required. hreq: required only in hardened mode.
             req()  { "$@" && return 0; crt_die "step failed: $*"; }
             hreq() { "$@" && return 0; [ "$hardened" = 1 ] && crt_die "step failed: $*"; return 0; }
-            # canon: canonical target that must stay under the rootfs (no symlink escape).
+            # canon: canonical path that must stay under the rootfs (no symlink escape).
             canon() {
                 local t; t=$(realpath -m -- "$1") || crt_die "cannot resolve $1"
                 case "$t" in "$rootfs"|"$rootfs"/*) printf "%s\n" "$t" ;;
-                    *) crt_die "target escapes rootfs: $1 -> $t" ;; esac
+                    *) crt_die "path escapes rootfs: $1 -> $t" ;; esac
+            }
+            # safe_dir: canonical dir under the rootfs, created; refuses a symlink escape.
+            safe_dir() { local d; d=$(canon "$1"); mkdir -p "$d" || crt_die "mkdir $1"; printf "%s\n" "$d"; }
+            # safe_file: a regular file to use as a bind target. The parent dir must be
+            # under the rootfs; a symlink planted at the leaf is removed, never followed.
+            safe_file() {
+                local p d b
+                d=$(canon "$(dirname -- "$1")"); mkdir -p "$d" || crt_die "mkdir $(dirname -- "$1")"
+                b=$(basename -- "$1"); p="$d/$b"
+                [ -L "$p" ] && rm -f "$p"
+                [ -e "$p" ] || : > "$p" || crt_die "cannot create $p"
+                printf "%s\n" "$p"
             }
             # verify_ro: every mount at/under $1 must be read-only (fail closed).
             verify_ro() {
@@ -606,18 +640,27 @@ $out
 RO
             }
 
-            mkdir -p "$rootfs/proc" "$rootfs/etc" "$rootfs/oldroot" \
-                     "$rootfs/dev/pts" "$rootfs/dev/shm" "$rootfs/tmp" "$rootfs/sys"
+            # All fixed setup paths go through canon/safe_* so a symlink planted inside
+            # the rootfs cannot redirect a mkdir/touch/mount to a host path.
+            rproc=$(safe_dir "$rootfs/proc")
+            retc=$(safe_dir "$rootfs/etc")
+            safe_dir "$rootfs/oldroot" >/dev/null
+            rdev=$(safe_dir "$rootfs/dev")
+            rpts=$(safe_dir "$rootfs/dev/pts")
+            rshm=$(safe_dir "$rootfs/dev/shm")
+            rtmp=$(safe_dir "$rootfs/tmp")
+            rsys=$(safe_dir "$rootfs/sys")
+
             hreq mount --make-rprivate /
             # Make the rootfs a mount point first, so every submount below lands
             # on top of it and pivot_root can later use it as the new root.
             hreq mount --bind "$rootfs" "$rootfs"
-            hreq mount -t proc proc "$rootfs/proc"
+            hreq mount -t proc proc "$rproc"
             if [ "$net_none" = 1 ]; then
-                mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+                mount -t sysfs sysfs "$rsys" 2>/dev/null || true
             else
-                mount --bind /sys "$rootfs/sys" 2>/dev/null \
-                    || mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+                mount --bind /sys "$rsys" 2>/dev/null \
+                    || mount -t sysfs sysfs "$rsys" 2>/dev/null || true
             fi
 
             # Minimal /dev: bind only safe device nodes (never all of host /dev,
@@ -626,20 +669,20 @@ RO
             # (the kernel forbids device writes on a userns-created tmpfs).
             for n in null zero full random urandom tty; do
                 [ -e "/dev/$n" ] || continue
-                [ -e "$rootfs/dev/$n" ] || : > "$rootfs/dev/$n"
-                hreq mount --bind "/dev/$n" "$rootfs/dev/$n"
+                dn=$(safe_file "$rdev/$n")
+                hreq mount --bind "/dev/$n" "$dn"
             done
-            hreq mount -t devpts devpts "$rootfs/dev/pts" -o newinstance,ptmxmode=0666,mode=0620
-            ln -sfn pts/ptmx "$rootfs/dev/ptmx" 2>/dev/null || true
-            hreq mount -t tmpfs tmpfs "$rootfs/dev/shm"
+            hreq mount -t devpts devpts "$rpts" -o newinstance,ptmxmode=0666,mode=0620
+            ln -sfn pts/ptmx "$rdev/ptmx" 2>/dev/null || true
+            hreq mount -t tmpfs tmpfs "$rshm"
 
-            : > "$rootfs/etc/resolv.conf" 2>/dev/null || true
-            mount --bind /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+            rc=$(safe_file "$retc/resolv.conf")
+            mount --bind /etc/resolv.conf "$rc" 2>/dev/null || true
 
             if [ "$private_tmp" = 1 ]; then
-                hreq mount -t tmpfs tmpfs "$rootfs/tmp"
+                hreq mount -t tmpfs tmpfs "$rtmp"
             else
-                hreq mount --bind /tmp "$rootfs/tmp"
+                hreq mount --bind /tmp "$rtmp"
             fi
 
             if [ "$no_home" != 1 ]; then
@@ -661,7 +704,7 @@ RO
                 if [ "$mode" = ro ]; then
                     mount -o remount,bind,ro=recursive "$tgt" 2>/dev/null \
                         || req mount -o remount,bind,ro "$tgt"
-                    [ -n "$CRT_TEST_MODE" ] || verify_ro "$tgt"
+                    [ "$crt_test" = 1 ] || verify_ro "$tgt"
                 fi
             done
 
@@ -678,17 +721,18 @@ RO
             done
 
             # POSIX-sh payload (runs under the rootfs /bin/sh, which may be dash):
-            # cd into the work dir, then optionally start from a clean environment.
-            # In the clean case the remaining args are  NAME=val... cmd args...  and
-            # env(1) itself stops treating args as assignments at the first non-NAME=val
-            # word, so no count is needed.
+            # cd into the work dir, then apply the requested environment to the command.
+            # env(1) stops treating args as assignments at the first non-NAME=val word,
+            # so the resolved NAME=val entries precede the command with no count needed.
+            # env is resolved absolutely so a poisoned rootfs cannot substitute it.
             payload='"'"'
                 wd=$1; clean=$2; mp=$3; mh=$4; shift 4
                 cd "$wd" 2>/dev/null || cd /
+                E=env; [ -x /usr/bin/env ] && E=/usr/bin/env || { [ -x /bin/env ] && E=/bin/env; }
                 if [ "$clean" = 1 ]; then
-                    exec env -i "PATH=$mp" "HOME=$mh" "$@"
+                    exec "$E" -i "PATH=$mp" "HOME=$mh" "$@"
                 else
-                    exec "$@"
+                    exec "$E" "$@"
                 fi
             '"'"'
 
@@ -701,9 +745,14 @@ RO
                     || crt_die "old root still mounted after pivot"
                 rmdir /oldroot 2>/dev/null || true
                 if [ "$hardened" = 1 ]; then
-                    { [ -x /usr/bin/setpriv ] || [ -x /bin/setpriv ]; } \
-                        || crt_die "setpriv not found in rootfs (needed to drop privileges)"
-                    exec setpriv --no-new-privs --bounding-set=-all \
+                    # Drop all privileges via an absolute setpriv (never a PATH lookup,
+                    # so a binary planted earlier on PATH cannot run with capabilities).
+                    setpriv=""
+                    for p in /usr/bin/setpriv /bin/setpriv /usr/sbin/setpriv /sbin/setpriv; do
+                        [ -x "$p" ] && { setpriv=$p; break; }
+                    done
+                    [ -n "$setpriv" ] || crt_die "setpriv not found in rootfs (needed to drop privileges)"
+                    exec "$setpriv" --no-new-privs --bounding-set=-all \
                             --inh-caps=-all --ambient-caps=-all \
                         /bin/sh -c "$payload" crt \
                             "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
@@ -711,7 +760,7 @@ RO
                     exec /bin/sh -c "$payload" crt \
                         "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
                 fi
-            elif [ -n "$CRT_TEST_MODE" ]; then
+            elif [ "$crt_test" = 1 ]; then
                 # Test-only path (PATH mocks, no real mount namespace): the mock
                 # pivot_root always fails, so fall back to chroot to exercise the code.
                 exec chroot "$rootfs" /bin/sh -c "$payload" crt \
@@ -721,7 +770,8 @@ RO
             fi
         ' -- "$rootfs" "$HOME" "$workdir" \
             "$no_home" "$private_tmp" "$net_none" "$ro_root" "$clean_env" "$hardened" \
-            "$minpath" "$minhome" "$keepfds" "${#all_mounts[@]}" "${all_mounts[@]}" \
+            "$crt_test" "$crt_binpath" "$minpath" "$minhome" "$keepfds" \
+            "${#all_mounts[@]}" "${all_mounts[@]}" \
             "${resolved_envs[@]}" "$@"
     local _rc
     _rc=$?
