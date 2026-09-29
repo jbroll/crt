@@ -28,7 +28,7 @@ if ! unshare --user --map-root-user --mount --pid -f true 2>/dev/null; then
 fi
 
 # ── throwaway rootfs that borrows the host /usr at run time ───────────────────
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d -p /var/tmp crt-iso.XXXXXX)"   # not /tmp: hardened runs refuse a CRT_HOME there
 export CRT_HOME="$WORK/home"
 
 # Build a throwaway rootfs <name> whose stored config lives outside the rootfs
@@ -41,6 +41,15 @@ build_rootfs() {
         t="$(readlink "/$d" 2>/dev/null)" && ln -s "$t" "$r/$d"
     done
     printf 'image void\n' > "$CRT_HOME/.config/$n"
+    mark_pristine "$n"
+}
+
+# The marker crt create writes: "dev:inode canonical-path" of the rootfs dir.
+mark_pristine() {
+    local d
+    d=$(realpath -e "$CRT_HOME/$1")
+    mkdir -p "$CRT_HOME/.state"
+    printf '%s %s\n' "$(stat -c '%d:%i' "$d")" "$d" > "$CRT_HOME/.state/$1.pristine"
 }
 NAME=iso
 build_rootfs iso        # pristine; used for all hardened runs
@@ -168,10 +177,8 @@ check "New-3: the PATH-planted setpriv did not run" "safe" "$s"
 # ── finding 7: pre-pivot setup must not follow symlinks planted in the rootfs ──
 # 7a: a planted /etc/resolv.conf symlink to an outside file must not be followed
 # (the outside file must keep its contents; crt removes the leaf link).
+build_rootfs poison7a
 P7="$CRT_HOME/poison7a"
-mkdir -p "$P7"/{etc,proc,dev,tmp,usr/bin,usr/lib}
-for d in bin lib lib64 sbin; do t="$(readlink "/$d")" && ln -s "$t" "$P7/$d"; done
-printf 'image void\n' > "$P7/config"
 OUTSIDE="$WORK/outside_secret"; echo keep-me > "$OUTSIDE"
 ln -sf "$OUTSIDE" "$P7/etc/resolv.conf"
 "$CRT" run --no-home "${USR_RO[@]}" poison7a /bin/true 2>/dev/null || true
@@ -179,13 +186,14 @@ check "finding7: planted resolv.conf symlink did not truncate outside file" "kee
 
 # 7b: a planted /dev symlink to an outside directory must be refused (abort),
 # and no device placeholder may be created in that outside directory.
+build_rootfs poison7b
 P7B="$CRT_HOME/poison7b"
-mkdir -p "$P7B"/{etc,proc,tmp,usr/bin,usr/lib}
-for d in bin lib lib64 sbin; do t="$(readlink "/$d")" && ln -s "$t" "$P7B/$d"; done
-printf 'image void\n' > "$P7B/config"
+rmdir "$P7B/dev"
 OUTDEV="$WORK/outside_dev"; mkdir -p "$OUTDEV"
 ln -sf "$OUTDEV" "$P7B/dev"
-if "$CRT" run --no-home "${USR_RO[@]}" poison7b /bin/true 2>/dev/null; then rc7=ran; else rc7=aborted; fi
+if err7=$("$CRT" run --no-home "${USR_RO[@]}" poison7b /bin/true 2>&1); then rc7=ran
+elif printf '%s' "$err7" | grep -q "escapes rootfs"; then rc7=aborted
+else rc7="failed-otherwise: $err7"; fi
 check "finding7: planted /dev symlink aborts the run" "aborted" "$rc7"
 check "finding7: no device node created in the outside dir" "0" "$(find "$OUTDEV" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
 
@@ -211,6 +219,16 @@ check "New-6: hardened refused on a rootfs with planted helpers (tainted)" "refu
 # isodef was run writable by the default-behaviour block above; hardened refused.
 if "$CRT" run --clean-env "${USR_RO[@]}" isodef /bin/true 2>/dev/null; then td=ran; else td=refused; fi
 check "New-6: hardened refused on the previously-writable default rootfs" "refused" "$td"
+
+# ── pristine marker: a legacy rootfs (config inside, no marker) is refused ─────
+mkdir -p "$CRT_HOME/legacyr"/{etc,proc,dev,tmp,usr/bin,usr/lib}
+for d in bin lib lib64 sbin; do t="$(readlink "/$d")" && ln -s "$t" "$CRT_HOME/legacyr/$d"; done
+printf 'image void\n' > "$CRT_HOME/legacyr/config"
+if errl=$("$CRT" run --clean-env --no-home "${USR_RO[@]}" legacyr /bin/true 2>&1); then lr=ran
+elif printf '%s' "$errl" | grep -q "is not pristine"; then lr=refused; else lr="other: $errl"; fi
+check "pristine: a legacy rootfs with no marker is refused for hardened use" "refused" "$lr"
+check "pristine: its legacy config was migrated out of the rootfs" "yes" \
+    "$([ -f "$CRT_HOME/.config/legacyr" ] && [ ! -e "$CRT_HOME/legacyr/config" ] && echo yes || echo no)"
 
 echo
 echo "passed $pass, failed $fail"

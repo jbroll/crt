@@ -2,7 +2,7 @@
   "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
   "layers": [
     {
-      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "digest": "sha256:6a79808199d005803afc52161c0f17915bb6052587ebbdeb87a99b743f3b8e60"
     }
   ]
 }

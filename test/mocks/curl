@@ -1,4 +1,7 @@
 #!/bin/sh
+# Mock curl: canned token and manifest, and the fixed fixture layer for blobs.
+# CRT_MOCK_CURL_LOG: append a line per blob fetch.
+# CRT_MOCK_BAD_BLOB=1: serve a blob whose content does not match its digest.
 FIXTURES="$(cd "$(dirname "$0")/../fixtures" && pwd)"
 url=""
 outfile=""
@@ -13,16 +16,15 @@ case "$url" in
     *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
     */manifests/*) cat "$FIXTURES/manifest.json" ;;
     */blobs/*)
-        tmpdir=$(mktemp -d)
-        mkdir -p "$tmpdir/bin"
-        printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$tmpdir/bin/sh"
-        chmod +x "$tmpdir/bin/sh"
-        if [ -n "$outfile" ]; then
-            tar -czf "$outfile" -C "$tmpdir" .
+        [ -n "$CRT_MOCK_CURL_LOG" ] && echo blob >> "$CRT_MOCK_CURL_LOG"
+        if [ -n "$CRT_MOCK_BAD_BLOB" ]; then
+            src=$(mktemp); printf 'tampered\n' > "$src"
         else
-            tar -czf - -C "$tmpdir" .
+            src="$FIXTURES/layer.tar.gz"
         fi
-        rm -rf "$tmpdir"
+        if [ -n "$outfile" ]; then cp "$src" "$outfile"; else cat "$src"; fi
+        [ -n "$CRT_MOCK_BAD_BLOB" ] && rm -f "$src"
         ;;
     *) printf 'mock-curl: unhandled url: %s\n' "$url" >&2; exit 1 ;;
 esac
+exit 0

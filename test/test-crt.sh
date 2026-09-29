@@ -9,15 +9,15 @@ export PATH="$MOCKS:$PATH"
 
 # The mocks provide no real mount namespace, so the mock pivot_root always fails.
 # Test mode lets cmd_run resolve its binaries from the mocks, fall back to chroot,
-# and skip ro verification. It is enabled only when CRT_TEST_MODE names a directory
-# carrying the mocks' marker file (test/mocks/.crt-mocks) — a bare CRT_TEST_MODE=1
-# from a normal caller does nothing. Real runs never point it at a mocks dir.
+# and skip ro verification. crt enables it only when CRT_TEST_MODE names this
+# repo's own test/mocks directory (with its .crt-mocks marker).
 export CRT_TEST_MODE="$MOCKS"
 
 . "$SCRIPT_DIR/Test"
 
-# Per-test temp home; cleaned on exit
-CRT_HOME=$(mktemp -d)
+# Per-test temp home; cleaned on exit. Hardened runs refuse a CRT_HOME under /tmp
+# or $HOME, so use /var/tmp.
+CRT_HOME=$(mktemp -d -p /var/tmp crt-test.XXXXXX)
 export CRT_HOME
 CRT_BIN=$(mktemp -d)
 export CRT_BIN
@@ -52,6 +52,26 @@ make_rootfs() {
     mkdir -p "$dir/bin" "$CRT_HOME/.config"
     printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$dir/bin/sh"
     chmod +x "$dir/bin/sh"
+}
+
+# Helper: write the pristine marker crt create would write for rootfs <name>
+# ("dev:inode canonical-path").
+mark_pristine() {
+    local d
+    d=$(realpath -e "$CRT_HOME/$1") || return 1
+    mkdir -p "$CRT_HOME/.state"
+    printf '%s %s\n' "$(stat -c '%d:%i' "$d")" "$d" > "$CRT_HOME/.state/$1.pristine"
+}
+
+# crt_run: `crt run` after re-marking every mock rootfs pristine, standing in
+# for a fresh `crt create` so tests that reuse a rootfs across default and
+# hardened runs keep working. Tests of the pristine rule itself call "$CRT" run.
+crt_run() {
+    local d
+    for d in "$CRT_HOME"/*/; do
+        [ -d "$d/bin" ] && mark_pristine "$(basename "$d")"
+    done
+    "$CRT" run "$@"
 }
 
 # ── parse_memory ─────────────────────────────────────────────────────────────
@@ -242,6 +262,14 @@ CRT_MOCK_LOG="$klog" "$CRT" create keyenv 2>/dev/null
 if grep -q -- ' -S ' "$klog" && [ -f "$CRT_HOME/keyenv/var/db/xbps/keys/fake-key.plist" ]; then Pass; else Fail; fi
 rm -f "$klog"
 
+Test "create xbps path: xbps-install gets /dev/null on stdin (no key prompt)"
+klog=$(mktemp)
+# crt's own stdin is a pipe here; xbps-install must still see /dev/null.
+printf 'y\n' | CRT_MOCK_LOG="$klog" "$CRT" create stdinenv >/dev/null 2>&1
+if grep -q '^xbps-install .*stdin=/dev/null$' "$klog" \
+   && ! grep '^xbps-install' "$klog" | grep -qv 'stdin=/dev/null$'; then Pass; else Fail; fi
+rm -f "$klog"
+
 Test "create xbps path: aborts clearly when no repo keys are present"
 emptykeys=$(mktemp -d)
 out=$(XBPS_KEYS_DIR="$emptykeys" "$CRT" create nokeyenv 2>&1 || true)
@@ -288,44 +316,44 @@ echo "# cmd_run"
 make_rootfs runenv
 
 Test "run: not-found error goes to stderr"
-err=$("$CRT" run noexist echo hi 2>&1 >/dev/null || true)
+err=$(crt_run noexist echo hi 2>&1 >/dev/null || true)
 if echo "$err" | grep -q "not found"; then Pass; else Fail; fi
 
 Test "run: env var from config"
 printf 'env GREETING=hello\n' > "$(conf runenv)"
-result=$("$CRT" run runenv printenv GREETING 2>/dev/null)
+result=$(crt_run runenv printenv GREETING 2>/dev/null)
 CompareArgs "$result" "hello"
 
 Test "run: -e flag sets env var"
 printf '' > "$(conf runenv)"
-result=$("$CRT" run -e COLOR=blue runenv printenv COLOR 2>/dev/null)
+result=$(crt_run -e COLOR=blue runenv printenv COLOR 2>/dev/null)
 CompareArgs "$result" "blue"
 
 Test "run: -e flag overrides config env"
 printf 'env MODE=production\n' > "$(conf runenv)"
-result=$("$CRT" run -e MODE=debug runenv printenv MODE 2>/dev/null)
+result=$(crt_run -e MODE=debug runenv printenv MODE 2>/dev/null)
 CompareArgs "$result" "debug"
 
 Test "run: multiple -e flags"
 printf '' > "$(conf runenv)"
-result=$("$CRT" run -e A=1 -e B=2 runenv sh -c 'echo $A-$B' 2>/dev/null)
+result=$(crt_run -e A=1 -e B=2 runenv sh -c 'echo $A-$B' 2>/dev/null)
 CompareArgs "$result" "1-2"
 
 Test "run: command exits with correct code"
-"$CRT" run runenv sh -c 'exit 0' 2>/dev/null
+crt_run runenv sh -c 'exit 0' 2>/dev/null
 rc=$?
 CompareArgs "$rc" "0"
 
 Test "run: unknown flag error"
-err=$("$CRT" run -z runenv echo hi 2>&1 || true)
+err=$(crt_run -z runenv echo hi 2>&1 || true)
 if echo "$err" | grep -q "unknown option"; then Pass; else Fail; fi
 
 Test "run: mount spec without colon is rejected"
-err=$("$CRT" run -v /nocopath runenv echo hi 2>&1 || true)
+err=$(crt_run -v /nocopath runenv echo hi 2>&1 || true)
 if echo "$err" | grep -q "must be host:container"; then Pass; else Fail; fi
 
 Test "run: memory limit warns when cgroup not available"
-err=$("$CRT" run -m 512M runenv echo hi 2>&1 >/dev/null || true)
+err=$(crt_run -m 512M runenv echo hi 2>&1 >/dev/null || true)
 if echo "$err" | grep -q "resource limits not applied"; then Pass; else Fail; fi
 
 # ── cmd_list ─────────────────────────────────────────────────────────────────
@@ -363,65 +391,28 @@ Test "layer blob written to cache"
 blobs=$(ls "$CRT_HOME/.cache/layers/" 2>/dev/null | wc -l)
 if [ "$blobs" -gt 0 ]; then Pass; else Fail; fi
 
+DIGEST_FILE="sha256-6a79808199d005803afc52161c0f17915bb6052587ebbdeb87a99b743f3b8e60"
+
 Test "second create reuses cache (curl not called for blob)"
-# Track curl calls via a counter file
 CURL_LOG=$(mktemp)
-cat > "$MOCKS/curl" << MOCKEOF
-#!/bin/sh
-FIXTURES="\$(cd "\$(dirname "\$0")/../fixtures" && pwd)"
-url=""
-outfile=""
-while [ \$# -gt 0 ]; do
-    case "\$1" in
-        -o) outfile="\$2"; shift 2 ;;
-        http*) url="\$1"; shift ;;
-        *) shift ;;
-    esac
-done
-case "\$url" in
-    *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
-    */manifests/*) cat "\$FIXTURES/manifest.json" ;;
-    */blobs/*) echo blob >> "$CURL_LOG"; if [ -n "\$outfile" ]; then cp "\$CRT_HOME/.cache/layers/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "\$outfile"; else cat "\$CRT_HOME/.cache/layers/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; fi ;;
-    *) printf 'unhandled: %s\n' "\$url" >&2; exit 1 ;;
-esac
-MOCKEOF
-chmod +x "$MOCKS/curl"
-"$CRT" create cachetest2 alpine:3.19 2>/dev/null
-blob_fetches=$(wc -l < "$CURL_LOG" 2>/dev/null || echo 0)
+CRT_MOCK_CURL_LOG="$CURL_LOG" "$CRT" create cachetest2 alpine:3.19 2>/dev/null
+blob_fetches=$(wc -l < "$CURL_LOG")
 rm -f "$CURL_LOG"
-# Restore original curl mock
-cat > "$MOCKS/curl" << 'MOCKEOF'
-#!/bin/sh
-FIXTURES="$(cd "$(dirname "$0")/../fixtures" && pwd)"
-url=""
-outfile=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -o) outfile="$2"; shift 2 ;;
-        http*) url="$1"; shift ;;
-        *) shift ;;
-    esac
-done
-case "$url" in
-    *auth*|*token*) printf '{"token":"mock-token"}\n' ;;
-    */manifests/*) cat "$FIXTURES/manifest.json" ;;
-    */blobs/*)
-        tmpdir=$(mktemp -d)
-        mkdir -p "$tmpdir/bin"
-        printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$tmpdir/bin/sh"
-        chmod +x "$tmpdir/bin/sh"
-        if [ -n "$outfile" ]; then
-            tar -czf "$outfile" -C "$tmpdir" .
-        else
-            tar -czf - -C "$tmpdir" .
-        fi
-        rm -rf "$tmpdir"
-        ;;
-    *) printf 'mock-curl: unhandled url: %s\n' "$url" >&2; exit 1 ;;
-esac
-MOCKEOF
-chmod +x "$MOCKS/curl"
 CompareArgs "$blob_fetches" "0"
+
+Test "OCI: a downloaded blob that fails its digest aborts the create"
+rm -f "$CRT_HOME/.cache/layers/$DIGEST_FILE"
+out=$(CRT_MOCK_BAD_BLOB=1 "$CRT" create badblob alpine:3.19 2>&1 || true)
+if echo "$out" | grep -q "does not match its manifest digest" \
+   && [ ! -e "$CRT_HOME/badblob" ] && [ ! -e "$CRT_HOME/.cache/layers/$DIGEST_FILE" ]; then Pass; else Fail; fi
+
+Test "OCI: a corrupt cached blob is deleted and refetched"
+printf 'corrupt\n' > "$CRT_HOME/.cache/layers/$DIGEST_FILE"
+CURL_LOG=$(mktemp)
+CRT_MOCK_CURL_LOG="$CURL_LOG" "$CRT" create refetch alpine:3.19 >/dev/null 2>&1
+fetches=$(wc -l < "$CURL_LOG"); rm -f "$CURL_LOG"
+if [ "$fetches" = 1 ] && [ -f "$CRT_HOME/refetch/bin/sh" ] \
+   && sha256sum "$CRT_HOME/.cache/layers/$DIGEST_FILE" | grep -q '^6a798081'; then Pass; else Fail; fi
 
 # ── cmd_export ────────────────────────────────────────────────────────────────
 echo "# cmd_export"
@@ -529,7 +520,7 @@ printf '' > "$(conf isoenv)"
 run_logged() {
     local log
     log=$(mktemp)
-    CRT_MOCK_LOG="$log" "$CRT" run "$@" >/dev/null 2>&1
+    CRT_MOCK_LOG="$log" crt_run "$@" >/dev/null 2>&1
     cat "$log"
     rm -f "$log"
 }
@@ -578,15 +569,15 @@ Test "run: --ro-root remounts the rootfs read-only"
 if run_logged --ro-root isoenv true | grep -q -- "^mount -o remount,bind,ro $CRT_HOME/isoenv$"; then Pass; else Fail; fi
 
 Test "run: invalid --net value is rejected"
-err=$("$CRT" run --net bogus isoenv true 2>&1 || true)
+err=$(crt_run --net bogus isoenv true 2>&1 || true)
 if echo "$err" | grep -q "invalid net mode"; then Pass; else Fail; fi
 
 Test "run: invalid --tmp value is rejected"
-err=$("$CRT" run --tmp bogus isoenv true 2>&1 || true)
+err=$(crt_run --tmp bogus isoenv true 2>&1 || true)
 if echo "$err" | grep -q "invalid tmp mode"; then Pass; else Fail; fi
 
 Test "run: long --env flag works"
-result=$("$CRT" run --env SHADE=green isoenv printenv SHADE 2>/dev/null)
+result=$(crt_run --env SHADE=green isoenv printenv SHADE 2>/dev/null)
 CompareArgs "$result" "green"
 
 Test "run: long --volume flag is accepted"
@@ -598,72 +589,72 @@ rmdir "$tmpsrc"
 echo "# cmd_run clean environment"
 
 Test "run: default inherits caller environment"
-result=$(CALLER_VAR=leaked "$CRT" run isoenv printenv CALLER_VAR 2>/dev/null)
+result=$(CALLER_VAR=leaked crt_run isoenv printenv CALLER_VAR 2>/dev/null)
 CompareArgs "$result" "leaked"
 
 Test "run: --clean-env drops caller environment"
-result=$(CALLER_VAR=leaked "$CRT" run --clean-env isoenv sh -c 'echo "${CALLER_VAR:-unset}"' 2>/dev/null)
+result=$(CALLER_VAR=leaked crt_run --clean-env isoenv sh -c 'echo "${CALLER_VAR:-unset}"' 2>/dev/null)
 CompareArgs "$result" "unset"
 
 Test "run: --clean-env sets a minimal HOME"
-result=$("$CRT" run --clean-env isoenv sh -c 'echo "$HOME"' 2>/dev/null)
+result=$(crt_run --clean-env isoenv sh -c 'echo "$HOME"' 2>/dev/null)
 CompareArgs "$result" "/tmp"
 
 Test "run: --clean-env sets a minimal PATH"
-result=$("$CRT" run --clean-env isoenv sh -c 'echo "$PATH"' 2>/dev/null)
+result=$(crt_run --clean-env isoenv sh -c 'echo "$PATH"' 2>/dev/null)
 CompareArgs "$result" "/usr/bin:/bin:/usr/local/bin"
 
 Test "run: -e NAME passes the caller's value through a clean env"
-result=$(TOKEN=abc123 "$CRT" run --clean-env -e TOKEN isoenv printenv TOKEN 2>/dev/null)
+result=$(TOKEN=abc123 crt_run --clean-env -e TOKEN isoenv printenv TOKEN 2>/dev/null)
 CompareArgs "$result" "abc123"
 
 Test "run: -e NAME=val still works with a clean env"
-result=$("$CRT" run --clean-env -e SHAPE=round isoenv printenv SHAPE 2>/dev/null)
+result=$(crt_run --clean-env -e SHAPE=round isoenv printenv SHAPE 2>/dev/null)
 CompareArgs "$result" "round"
 
 Test "run: -e for an unset var warns and is skipped"
-warn=$("$CRT" run --clean-env -e DEFINITELY_UNSET_VAR isoenv true 2>&1 >/dev/null || true)
+warn=$(crt_run --clean-env -e DEFINITELY_UNSET_VAR isoenv true 2>&1 >/dev/null || true)
 if echo "$warn" | grep -q "not set in environment"; then Pass; else Fail; fi
 
 # ── cmd_run: file descriptors ─────────────────────────────────────────────────
 echo "# cmd_run file descriptors"
 
 Test "run: --keep-fd keeps the listed fd open"
-result=$("$CRT" run --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'fd-payload' 2>/dev/null)
+result=$(crt_run --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'fd-payload' 2>/dev/null)
 CompareArgs "$result" "fd-payload"
 
 Test "run: --keep-fd works with a clean env"
-result=$("$CRT" run --clean-env --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'clean-fd' 2>/dev/null)
+result=$(crt_run --clean-env --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'clean-fd' 2>/dev/null)
 CompareArgs "$result" "clean-fd"
 
 Test "run: an unlisted fd is closed"
-result=$("$CRT" run isoenv sh -c 'cat <&3 2>/dev/null && echo LEAK || echo closed' 3<<<'secret' 2>/dev/null)
+result=$(crt_run isoenv sh -c 'cat <&3 2>/dev/null && echo LEAK || echo closed' 3<<<'secret' 2>/dev/null)
 CompareArgs "$result" "closed"
 
 Test "run: -e NODE_CHANNEL_FD keeps that fd open automatically"
-result=$(NODE_CHANNEL_FD=3 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&3' 3<<<'ipc-msg' 2>/dev/null)
+result=$(NODE_CHANNEL_FD=3 crt_run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&3' 3<<<'ipc-msg' 2>/dev/null)
 CompareArgs "$result" "ipc-msg"
 
 Test "run: NODE_CHANNEL_FD naming an unopened fd is not kept (New-4)"
-result=$(NODE_CHANNEL_FD=9 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&9 2>/dev/null && echo LEAK || echo closed' 2>/dev/null)
+result=$(NODE_CHANNEL_FD=9 crt_run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&9 2>/dev/null && echo LEAK || echo closed' 2>/dev/null)
 CompareArgs "$result" "closed"
 
 Test "run: NODE_CHANNEL_FD <= 2 is not auto-kept and does not error (New-4)"
-result=$(NODE_CHANNEL_FD=1 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
+result=$(NODE_CHANNEL_FD=1 crt_run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
 CompareArgs "$result" "ok"
 
 Test "run: NODE_CHANNEL_FD non-numeric does not trip fd validation (New-4)"
-result=$(NODE_CHANNEL_FD=notanfd "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
+result=$(NODE_CHANNEL_FD=notanfd crt_run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'echo ok' 2>/dev/null)
 CompareArgs "$result" "ok"
 
 Test "run: keep-fd directive from config keeps the fd open"
 printf 'keep-fd 3\n' > "$(conf isoenv)"
-result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'cfg-fd' 2>/dev/null)
+result=$(crt_run isoenv sh -c 'cat <&3' 3<<<'cfg-fd' 2>/dev/null)
 CompareArgs "$result" "cfg-fd"
 printf '' > "$(conf isoenv)"
 
 Test "run: --keep-fd rejects a non-numeric value"
-err=$("$CRT" run --keep-fd abc isoenv true 2>&1 || true)
+err=$(crt_run --keep-fd abc isoenv true 2>&1 || true)
 if echo "$err" | grep -q "must be a number"; then Pass; else Fail; fi
 
 # ── read_config: keep-fd directive ────────────────────────────────────────────
@@ -686,13 +677,13 @@ Test "run: a bare CRT_TEST_MODE value does not select the mocks (New-2)"
 # namespace and, on this rootfs, fails — that is fine; we only check the mock was
 # not selected, i.e. an inherited env value cannot arm test mode.)
 loggate=$(mktemp)
-CRT_TEST_MODE=1 CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true
+CRT_TEST_MODE=1 CRT_MOCK_LOG="$loggate" crt_run isoenv true >/dev/null 2>&1 || true
 if grep -q '^unshare ' "$loggate"; then Fail; else Pass; fi
 rm -f "$loggate"
 
 Test "run: the marker-gated CRT_TEST_MODE does select the mocks"
 loggate=$(mktemp)
-CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true
+CRT_MOCK_LOG="$loggate" crt_run isoenv true >/dev/null 2>&1 || true
 if grep -q '^unshare ' "$loggate"; then Pass; else Fail; fi
 rm -f "$loggate"
 
@@ -700,9 +691,18 @@ Test "run: a relative CRT_TEST_MODE does not arm test mode (item 5)"
 # A relative path (even one with a marker in cwd) must not enable test mode.
 mkdir -p "$CRT_HOME/reltm"; : > "$CRT_HOME/reltm/.crt-mocks"
 loggate=$(mktemp)
-( cd "$CRT_HOME" && CRT_TEST_MODE=reltm CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true >/dev/null 2>&1 || true )
+( cd "$CRT_HOME" && CRT_TEST_MODE=reltm CRT_MOCK_LOG="$loggate" crt_run isoenv true >/dev/null 2>&1 || true )
 if grep -q '^unshare ' "$loggate"; then Fail; else Pass; fi
 rm -f "$loggate"
+
+Test "run: CRT_TEST_MODE naming another dir with a marker does not arm test mode"
+foreign=$(mktemp -d -p /var/tmp crt-foreign.XXXXXX)
+: > "$foreign/.crt-mocks"
+printf '#!/bin/sh\necho FOREIGN >> "$CRT_MOCK_LOG"\n' > "$foreign/unshare"; chmod +x "$foreign/unshare"
+loggate=$(mktemp)
+CRT_TEST_MODE="$foreign" CRT_MOCK_LOG="$loggate" crt_run isoenv true >/dev/null 2>&1 || true
+if grep -q -e FOREIGN -e '^unshare ' "$loggate"; then Fail; else Pass; fi
+rm -rf "$foreign" "$loggate"
 
 # ── ignore caller-exported shell functions (item 5) ───────────────────────────
 echo "# exported function immunity"
@@ -713,7 +713,7 @@ Test "run: a caller-exported function named like a command is ignored"
 loggate=$(mktemp)
 unshare() { echo FAKE-UNSHARE-RAN; }
 export -f unshare
-out=$(CRT_MOCK_LOG="$loggate" "$CRT" run isoenv true 2>&1 || true)
+out=$(CRT_MOCK_LOG="$loggate" crt_run isoenv true 2>&1 || true)
 unset -f unshare
 if ! echo "$out" | grep -q FAKE-UNSHARE-RAN && grep -q '^unshare ' "$loggate"; then Pass; else Fail; fi
 rm -f "$loggate"
@@ -721,15 +721,95 @@ rm -f "$loggate"
 # ── New-6: hardened mode refuses a tainted rootfs ─────────────────────────────
 echo "# New-6 pristine-rootfs requirement"
 
-Test "run: hardened run is refused on a tainted rootfs"
-mkdir -p "$CRT_HOME/.state"; : > "$CRT_HOME/.state/isoenv.tainted"
-err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
-if echo "$err" | grep -q "requires a pristine rootfs"; then Pass; else Fail; fi
+Test "create: writes a pristine marker keyed on the rootfs identity"
+d=$(realpath "$CRT_HOME/voidenv")
+CompareArgs "$(cat "$CRT_HOME/.state/voidenv.pristine")" "$(stat -c %d:%i "$d") $d"
 
-Test "run: a default run is still allowed on a tainted rootfs"
-result=$("$CRT" run isoenv sh -c 'echo ok' 2>/dev/null)
-CompareArgs "$result" "ok"
-rm -f "$CRT_HOME/.state/isoenv.tainted"
+Test "run: hardened run is refused without a pristine marker"
+rm -f "$CRT_HOME/.state/isoenv.pristine"
+err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
+if echo "$err" | grep -q "is not pristine"; then Pass; else Fail; fi
+
+Test "run: hardened run is accepted with a matching marker"
+mark_pristine isoenv
+CompareArgs "$("$CRT" run --clean-env isoenv sh -c 'echo ok' 2>/dev/null)" "ok"
+
+Test "run: a non-hardened run deletes the pristine marker first"
+mark_pristine isoenv
+"$CRT" run isoenv true >/dev/null 2>&1
+if [ ! -e "$CRT_HOME/.state/isoenv.pristine" ]; then Pass; else Fail; fi
+
+Test "run: a non-hardened run fails closed if it cannot delete the marker"
+mark_pristine isoenv
+chmod a-w "$CRT_HOME/.state"
+out=$("$CRT" run isoenv sh -c 'echo RAN' 2>&1 || true)
+chmod u+w "$CRT_HOME/.state"
+if echo "$out" | grep -q "cannot remove the pristine marker" && ! echo "$out" | grep -q RAN; then Pass; else Fail; fi
+
+Test "run: a marker for another directory (renamed/re-created) is not honoured"
+mark_pristine isoenv
+mv "$CRT_HOME/isoenv" "$CRT_HOME/isoenv.old"; make_rootfs isoenv
+err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
+rm -rf "$CRT_HOME/isoenv"; mv "$CRT_HOME/isoenv.old" "$CRT_HOME/isoenv"
+if echo "$err" | grep -q "is not pristine"; then Pass; else Fail; fi
+
+Test "run: a symlinked marker file is not honoured"
+d=$(realpath "$CRT_HOME/isoenv")
+printf '%s %s\n' "$(stat -c %d:%i "$d")" "$d" > "$CRT_HOME/.state/elsewhere"
+rm -f "$CRT_HOME/.state/isoenv.pristine"; ln -s elsewhere "$CRT_HOME/.state/isoenv.pristine"
+err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
+rm -f "$CRT_HOME/.state/isoenv.pristine" "$CRT_HOME/.state/elsewhere"
+if echo "$err" | grep -q "is not pristine"; then Pass; else Fail; fi
+
+# ── rootfs names and aliases ──────────────────────────────────────────────────
+echo "# rootfs names"
+
+for bad in 'isoenv/' '../isoenv' '.hidden' 'a/b' '-x' ''; do
+    Test "run: rejects the name '$bad'"
+    err=$("$CRT" run -- "$bad" true 2>&1 || true)
+    if [ -z "$bad" ]; then
+        if echo "$err" | grep -q "Usage"; then Pass; else Fail; fi
+    elif echo "$err" | grep -q "invalid name"; then Pass; else Fail; fi
+done
+
+Test "create: rejects an invalid name"
+err=$("$CRT" create 'bad/name' 2>&1 || true)
+if echo "$err" | grep -q "invalid name" && [ ! -e "$CRT_HOME/bad" ]; then Pass; else Fail; fi
+
+Test "rm and export: reject an invalid name"
+e1=$("$CRT" rm '../isoenv' 2>&1 || true); e2=$("$CRT" export 'isoenv/' sh 2>&1 || true)
+if echo "$e1" | grep -q "invalid name" && echo "$e2" | grep -q "invalid name" \
+   && [ -d "$CRT_HOME/isoenv" ]; then Pass; else Fail; fi
+
+Test "run: a symlink alias inside CRT_HOME is refused"
+ln -s isoenv "$CRT_HOME/aliasenv"
+err=$("$CRT" run aliasenv true 2>&1 || true)
+rm -f "$CRT_HOME/aliasenv"
+if echo "$err" | grep -q "real directory directly under CRT_HOME"; then Pass; else Fail; fi
+
+# ── CRT_HOME placement for hardened runs ──────────────────────────────────────
+echo "# CRT_HOME placement"
+
+Test "run: hardened run refused when CRT_HOME is under /tmp"
+th=$(mktemp -d -p /tmp crt-home.XXXXXX)
+CRT_HOME="$th" make_rootfs tenv; CRT_HOME="$th" mark_pristine tenv
+err=$(CRT_HOME="$th" "$CRT" run --clean-env tenv true 2>&1 || true)
+rm -rf "$th"
+if echo "$err" | grep -q "Move CRT_HOME outside"; then Pass; else Fail; fi
+
+Test "run: hardened run refused when a stored config mounts a path over CRT_HOME"
+printf 'mount %s:/crt\n' "$(dirname "$CRT_HOME")" > "$(conf bindsenv)"
+mark_pristine isoenv
+err=$("$CRT" run --clean-env isoenv true 2>&1 || true)
+rm -f "$(conf bindsenv)"
+if echo "$err" | grep -q "the mount source"; then Pass; else Fail; fi
+
+Test "run: a non-hardened run is not blocked by CRT_HOME placement"
+th=$(mktemp -d -p /tmp crt-home.XXXXXX)
+CRT_HOME="$th" make_rootfs tenv
+out=$(CRT_HOME="$th" "$CRT" run tenv sh -c 'echo ok' 2>/dev/null)
+rm -rf "$th"
+CompareArgs "$out" "ok"
 
 # ── stored config lives outside the rootfs (New-6) ────────────────────────────
 echo "# stored config location"
@@ -738,7 +818,7 @@ Test "run: config is read from outside the rootfs, not from /config in it"
 # A file planted at <rootfs>/config must be ignored; the outside config wins.
 printf 'env WHO=outside\n' > "$(conf isoenv)"
 printf 'env WHO=inside\n' > "$CRT_HOME/isoenv/config"
-result=$("$CRT" run isoenv printenv WHO 2>/dev/null)
+result=$(crt_run isoenv printenv WHO 2>/dev/null)
 CompareArgs "$result" "outside"
 rm -f "$CRT_HOME/isoenv/config"; printf '' > "$(conf isoenv)"
 
@@ -746,17 +826,32 @@ Test "run: a legacy in-rootfs config is migrated out on first use"
 make_rootfs legacyenv
 rm -f "$(conf legacyenv)"
 printf 'env LEG=migrated\n' > "$CRT_HOME/legacyenv/config"
-result=$("$CRT" run legacyenv printenv LEG 2>/dev/null)
+result=$(crt_run legacyenv printenv LEG 2>/dev/null)
 if [ "$result" = "migrated" ] && [ -f "$(conf legacyenv)" ] && [ ! -e "$CRT_HOME/legacyenv/config" ]; then Pass; else Fail; fi
+
+Test "run: a migrated legacy rootfs is not pristine"
+make_rootfs legacy2; rm -f "$(conf legacy2)"
+printf 'image void\n' > "$CRT_HOME/legacy2/config"
+mark_pristine legacy2
+err=$("$CRT" run --clean-env legacy2 true 2>&1 || true)
+if echo "$err" | grep -q "is not pristine" && [ -f "$(conf legacy2)" ]; then Pass; else Fail; fi
+
+Test "run: a symlinked legacy /config is refused, not migrated"
+make_rootfs legacy3; rm -f "$(conf legacy3)"
+printf 'mount /etc:/leak\n' > "$CRT_HOME/legacy3.target"
+ln -s "$CRT_HOME/legacy3.target" "$CRT_HOME/legacy3/config"
+err=$("$CRT" run legacy3 true 2>&1 || true)
+if echo "$err" | grep -q "not a regular file" && [ ! -e "$(conf legacy3)" ]; then Pass; else Fail; fi
+rm -f "$CRT_HOME/legacy3.target"
 
 # ── symlinked CRT_HOME works (item 4) ─────────────────────────────────────────
 echo "# symlinked CRT_HOME"
 
 Test "run: works when CRT_HOME is reached through a symlink"
-real_home=$(mktemp -d); link_home=$(mktemp -u)
+real_home=$(mktemp -d -p /var/tmp); link_home=$(mktemp -u -p /var/tmp)
 ln -s "$real_home" "$link_home"
 CRT_HOME="$real_home" make_rootfs symenv
-result=$(CRT_HOME="$link_home" "$CRT" run symenv sh -c 'echo linked-ok' 2>/dev/null)
+result=$(CRT_HOME="$link_home" crt_run symenv sh -c 'echo linked-ok' 2>/dev/null)
 CompareArgs "$result" "linked-ok"
 rm -rf "$real_home"; rm -f "$link_home"
 

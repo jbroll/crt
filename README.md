@@ -58,21 +58,29 @@ Any isolation option (`--net none`, `--no-home`, `--tmp private`, a `:ro` bind,
   rootfs from an earlier run cannot redirect setup to a host path.
 - **Read-only, pristine rootfs required.** The old-root detach and capability
   drop after `pivot_root` run the rootfs's own `umount`/`setpriv` while still
-  privileged, so a hardened run trusts the rootfs is unmodified. crt enforces
-  that: a hardened run forces the rootfs read-only for the duration, and it
-  **refuses** to run hardened on a rootfs that has ever been run writable since
-  it was created (tracked by a marker in `$CRT_HOME/.state/`, outside the
-  rootfs, that a container cannot clear). To use a rootfs for untrusted code,
-  create it and only ever run it hardened; recreate it if a writable run tainted
-  it. The rootfs's privileged binaries are trusted — see [Limitations](#limitations).
+  privileged, so a hardened run trusts the rootfs is unmodified. `crt create`
+  writes a pristine marker, `$CRT_HOME/.state/<name>.pristine`, recording the
+  rootfs's canonical path and device:inode. A hardened run requires a matching
+  marker and forces the rootfs read-only; every non-hardened run deletes the
+  marker before it starts (and does not start if it can't). A rootfs that was
+  ever run writable, migrated from an in-rootfs config, renamed, aliased, or
+  not made by `crt create` has no matching marker and is refused. To use a
+  rootfs for untrusted code, create it and only ever run it hardened (put
+  `root ro` in its config). See [Limitations](#limitations).
+- **CRT_HOME out of reach.** A hardened run is refused unless `CRT_HOME` lies
+  outside `$HOME`, `/tmp` and the host side of every `mount` line in every
+  stored config, since a non-hardened run can bind those and could then edit
+  a rootfs, its config or its marker. The default `/home/crt` is fine; keep
+  `CRT_HOME` outside `$HOME`.
 
 Without any isolation option, `crt run` behaves as before: the command runs as
 root with capabilities, so `crt run ubuntu apt install -y perl` still works
-(and marks the rootfs tainted, so a later hardened run of it is refused).
+(and removes the pristine marker, so a later hardened run of it is refused).
 
 The stored config never lives inside a rootfs (see [Config files](#config-files)),
 so a container cannot read or rewrite the config that governs its own — or a
-later — run.
+later — run. Rootfs names are single path components: letters, digits, `.`,
+`_`, `-`, starting with a letter or digit.
 
 ### File descriptors
 
@@ -152,7 +160,8 @@ Uses `xbps-install -S` to sync the Void repository index and bootstrap
 rootfs first so the non-interactive install can verify packages; if the host has
 no such keys, `crt create` fails with a clear message — install `xbps` or
 bootstrap from an OCI image instead. Set `XBPS_KEYS_DIR` to override the key
-source.
+source. `xbps-install` runs with stdin from `/dev/null`, so a repository signed
+by a key the host doesn't already trust fails the create instead of prompting.
 
 **From an OCI registry:**
 
@@ -163,7 +172,7 @@ crt create myapp ghcr.io/user/myapp:latest
 crt create staging quay.io/org/service:v2.1
 ```
 
-Supported registries: Docker Hub, ghcr.io, quay.io, and any registry implementing the OCI Distribution Spec. Public images only (no credential support). Multi-arch image indexes are handled — the layer matching the host architecture is selected automatically.
+Supported registries: Docker Hub, ghcr.io, quay.io, and any registry implementing the OCI Distribution Spec. Public images only (no credential support). Multi-arch image indexes are handled — the layer matching the host architecture is selected automatically. Every layer blob is checked against its manifest's sha256 digest, both after download and before a cached copy is reused; a mismatch aborts the create (download) or refetches (cache).
 
 ## Running commands
 
@@ -280,14 +289,18 @@ Each environment is a plain directory under `CRT_HOME`:
   .config/       ← per-rootfs stored config (outside every rootfs)
     ubuntu
     myenv
-  .state/        ← per-rootfs taint markers (<name>.tainted)
+  .state/        ← pristine markers (<name>.pristine), written by crt create
   .cache/
     layers/      ← OCI layer blobs, keyed by digest
 ```
 
+`CRT_HOME` must live outside `$HOME` and `/tmp` (as the default `/home/crt`
+does) for hardened runs; see [Hardened mode](#hardened-mode).
+
 Rootfs directories are self-contained; when moving or archiving one, take its
-`.config/<name>` entry with it. `.state/<name>.tainted`, if present, records that
-the rootfs was run writable and so is refused for hardened runs.
+`.config/<name>` entry with it. A moved or copied rootfs is not pristine (its
+marker records the original directory), so recreate it before using it
+hardened.
 
 OCI layers are cached in `.cache/layers/` and reused across environments. There is no automatic eviction — run `rm -rf $CRT_HOME/.cache` to clear.
 
@@ -306,25 +319,30 @@ bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
 | `pivot_root` | util-linux | Always fails, so in test mode `cmd_run` falls back to `chroot` (no real mount namespace under test) |
 | `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
 | `mount` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), then no-op |
-| `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
-| `xbps-install` | xbps | Logs its args (when `CRT_MOCK_LOG` is set), then creates a minimal `bin/sh` skeleton in the rootfs |
+| `curl` | curl | Returns canned token/manifest JSON and the fixture layer `test/fixtures/layer.tar.gz` (whose sha256 is the manifest digest); can log blob fetches or serve a tampered blob |
+| `xbps-install` | xbps | Logs its args and stdin target (when `CRT_MOCK_LOG` is set), then creates a minimal `bin/sh` skeleton in the rootfs |
 
-`test/test-crt.sh` sets `CRT_TEST_MODE` to the mocks directory, which carries a
-marker file (`test/mocks/.crt-mocks`). Test mode is enabled only when
-`CRT_TEST_MODE` is an **absolute** path to such a directory: it routes `crt`'s
-binary resolution through the mocks, lets `cmd_run` fall back to `chroot`, and
-skips read-only verification when the mock `pivot_root` fails. A bare
-`CRT_TEST_MODE=1`, or a relative path, does nothing. This lets the full
-`cmd_create` and `cmd_run` code paths run without root, namespaces, network, or
-xbps. 111 tests cover `parse_memory`, `read_config` (including the
+`test/test-crt.sh` sets `CRT_TEST_MODE` to its `test/mocks` directory. crt
+enables test mode only when `CRT_TEST_MODE` resolves to this repository's own
+`test/mocks` (found from the script's real path, carrying `.crt-mocks`): it
+takes `unshare` from the mocks, lets `cmd_run` fall back to `chroot`, and skips
+read-only verification when the mock `pivot_root` fails. Any other value does
+nothing. The suite keeps `CRT_HOME` under `/var/tmp`, and a `crt_run` helper
+re-marks the mock rootfs pristine before each run (standing in for `crt
+create`). This lets the full `cmd_create` and `cmd_run` code paths run without
+root, namespaces, network, or xbps. 134 tests cover `parse_memory`,
+`read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
 `write_config`, `parse_image_ref`, all three `create` dispatch paths (with the
-`xbps-install -S` / key-copy path), `run` flag and config merging, the generated
+`xbps-install -S` / key-copy / `/dev/null`-stdin path), OCI digest checks on
+download and cache reuse, `run` flag and config merging, the generated
 `unshare`/`mount` calls for each isolation flag, clean-env behavior,
-`--keep-fd`/fd closing and the `NODE_CHANNEL_FD` guards, the marker-gated
-absolute-path test-mode switch, immunity to caller-exported shell functions, the
-out-of-rootfs config and legacy migration, the tainted-rootfs refusal, a
-symlinked `CRT_HOME`, `list`, `rm`, OCI layer cache reuse, `export`, and `setup`.
+`--keep-fd`/fd closing and the `NODE_CHANNEL_FD` guards, the test-mode switch,
+immunity to caller-exported shell functions, name validation and alias
+refusal, the pristine marker (written by create, required by hardened runs,
+removed by writable runs, identity-keyed), `CRT_HOME` placement, the
+out-of-rootfs config and safe legacy migration, a symlinked `CRT_HOME`,
+`list`, `rm`, `export`, and `setup`.
 
 `test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
 (bind-mounted read-only) and proves, in real namespaces, mostly from one run
@@ -340,7 +358,8 @@ cannot substitute `crt`'s `unshare`, that a PATH-planted `setpriv` is not used
 (caps still dropped), and that planted `resolv.conf`/`/dev` symlinks in the
 rootfs are not followed. It also checks the out-of-rootfs config is unreachable
 to the container, and that hardened runs are refused on a rootfs previously run
-writable (the poisoned-rootfs / planted-`umount`/`setpriv` defense). 33 checks.
+writable (the poisoned-rootfs / planted-`umount`/`setpriv` defense) or carrying
+legacy in-rootfs config. Its `CRT_HOME` is under `/var/tmp`. 35 checks.
 
 ## Limitations
 
@@ -349,8 +368,15 @@ writable (the poisoned-rootfs / planted-`umount`/`setpriv` defense). 33 checks.
 - `--net none` isolates the network but provides no NAT/bridge, so the container has loopback only (no outbound access)
 - **The rootfs is trusted in hardened mode.** After `pivot_root`, crt runs the
   rootfs's own `umount` and `setpriv` while still privileged, so a modified
-  rootfs could defeat isolation. crt guards this by forcing the rootfs read-only
-  and refusing any rootfs run writable since it was created — but it does not
-  otherwise verify the rootfs contents. Build the rootfs from a trusted source
-  (`crt create`, or bind the host `/usr` read-only) and only ever run it
-  hardened.
+  rootfs could defeat isolation. crt guards this with the pristine marker and a
+  read-only root, but it does not otherwise verify the rootfs contents. Build
+  the rootfs from a trusted source (`crt create`, or bind the host `/usr`
+  read-only) and only ever run it hardened.
+- **The invoking environment is trusted.** crt drops shell functions exported
+  by its caller and takes `unshare` from fixed paths, but exported functions
+  named like the bash builtins it uses for that (`compgen`, `unset`, `builtin`,
+  `command`, `declare`) are out of scope. Only the environment that launches
+  crt can set them, and that environment can already run anything as the user.
+- **A `-v` flag on a non-hardened run can bind `CRT_HOME`.** The placement
+  check covers `$HOME`, `/tmp` and stored config; a one-off `-v` bind of
+  `CRT_HOME` into a writable run is an operator action and is not detected.

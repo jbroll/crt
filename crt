@@ -34,6 +34,105 @@ CRT_BIN="${CRT_BIN:-/home/crt/bin}"
 CRT_CONF_DIR="$CRT_HOME/.config"
 CRT_STATE_DIR="$CRT_HOME/.state"
 
+# Rootfs names are single path components: letters, digits, '.', '_', '-',
+# starting with a letter or digit. This rules out '/', '..', a trailing slash
+# and other aliases that would name the same rootfs under a different key.
+validate_name() {
+    if ! [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "Error: invalid name '$1' (use letters, digits, '.', '_', '-';" \
+             "start with a letter or digit; no '/')" >&2
+        exit 1
+    fi
+}
+
+# rootfs_identity DIR — "dev:inode canonical-path" of an existing rootfs dir.
+rootfs_identity() {
+    local p id
+    p=$(realpath -e -- "$1" 2>/dev/null) || return 1
+    id=$(stat -c '%d:%i' -- "$p" 2>/dev/null) || return 1
+    printf '%s %s\n' "$id" "$p"
+}
+
+# The pristine marker says "this rootfs is exactly what crt create wrote and has
+# not been run writable since". crt create writes it; hardened runs require it;
+# every non-hardened run deletes it first. It records the rootfs identity, so a
+# renamed, re-created, aliased or foreign rootfs never matches a stale marker,
+# and a rootfs with no marker (including legacy ones) is not pristine.
+pristine_marker() { printf '%s\n' "$CRT_STATE_DIR/$1.pristine"; }
+
+mark_pristine() {  # name rootfs
+    local m id
+    m=$(pristine_marker "$1")
+    id=$(rootfs_identity "$2") || return 1
+    mkdir -p "$CRT_STATE_DIR" || return 1
+    printf '%s\n' "$id" > "$m.tmp" && mv -f -- "$m.tmp" "$m"
+}
+
+is_pristine() {  # name rootfs
+    local m id want
+    m=$(pristine_marker "$1")
+    [ -f "$m" ] && [ ! -L "$m" ] || return 1
+    id=$(rootfs_identity "$2") || return 1
+    IFS= read -r want < "$m" || return 1
+    [ "$want" = "$id" ]
+}
+
+clear_pristine() {  # name — fail if the marker cannot be removed
+    local m
+    m=$(pristine_marker "$1")
+    rm -f -- "$m" 2>/dev/null
+    [ ! -e "$m" ] && [ ! -L "$m" ]
+}
+
+# _paths_overlap A B — true when one canonical path is at or under the other.
+_paths_overlap() {
+    local a="$1" b="$2"
+    if [ "$a" = / ] || [ "$b" = / ] || [ "$a" = "$b" ]; then return 0; fi
+    case "$a" in "$b"/*) return 0 ;; esac
+    case "$b" in "$a"/*) return 0 ;; esac
+    return 1
+}
+
+# Hardened guarantees rely on no container being able to reach CRT_HOME (rootfs
+# trees, .config, .state). A non-hardened run binds $HOME, /tmp and the host side
+# of any mount line in any stored config, so CRT_HOME must not overlap those.
+check_crt_home_placement() {  # canonical CRT_HOME
+    local home_real="$1" p cfg key val src c
+    local -a cand=()
+    if [ -n "${HOME:-}" ]; then
+        p=$(realpath -m -- "$HOME" 2>/dev/null) && cand+=("$p|\$HOME")
+    fi
+    p=$(realpath -m -- /tmp 2>/dev/null) && cand+=("$p|/tmp")
+    for cfg in "$CRT_CONF_DIR"/*; do
+        [ -f "$cfg" ] || continue
+        while read -r key val; do
+            [ "$key" = mount ] && [ -n "$val" ] || continue
+            src=${val%%:*}
+            p=$(realpath -m -- "$src" 2>/dev/null) \
+                && cand+=("$p|the mount source $src in the '${cfg##*/}' config")
+        done < "$cfg"
+    done
+    for c in "${cand[@]}"; do
+        if _paths_overlap "$home_real" "${c%%|*}"; then
+            echo "Error: CRT_HOME ($home_real) overlaps ${c#*|} (${c%%|*})," >&2
+            echo "  which a non-hardened run can bind, so a container could change a" >&2
+            echo "  rootfs, its config or its state. Move CRT_HOME outside \$HOME and /tmp" >&2
+            echo "  (the default /home/crt is fine) and keep mount sources out of it." >&2
+            return 1
+        fi
+    done
+}
+
+# This repo's own test/mocks dir, resolved from the script's real location. It
+# is the only directory CRT_TEST_MODE may name; an installed crt has none.
+crt_mocks_dir() {
+    local self dir
+    self=$(realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null) || return 1
+    dir=$(realpath -e -- "$(dirname -- "$self")/test/mocks" 2>/dev/null) || return 1
+    [ -f "$dir/.crt-mocks" ] || return 1
+    printf '%s\n' "$dir"
+}
+
 parse_image_ref() {
     local input="$1"
     local registry repo tag
@@ -145,6 +244,13 @@ oci_manifest() {
     echo "$manifest"
 }
 
+# _blob_matches FILE sha256:HEX — true when FILE's sha256 equals the digest.
+_blob_matches() {
+    local sum
+    sum=$(sha256sum -- "$1" 2>/dev/null) || return 1
+    [ "sha256:${sum%% *}" = "$2" ]
+}
+
 oci_unpack() {
     local registry="$1"
     local repo="$2"
@@ -161,10 +267,23 @@ oci_unpack() {
 
     local digest
     for digest in $layers; do
+        case "$digest" in
+            sha256:*) ;;
+            *) echo "Error: unsupported layer digest '$digest' (sha256 only)" >&2; return 1 ;;
+        esac
+        if ! [[ "${digest#sha256:}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Error: malformed layer digest '$digest'" >&2; return 1
+        fi
         local blob="$cache_dir/${digest//:/-}"
         echo "  layer ${digest:7:12}..."
 
-        # Ensure blob is cached
+        # A cached blob is reused only if it still matches its digest; a
+        # corrupt or tampered cache entry is deleted and fetched again.
+        if [ -f "$blob" ] && ! _blob_matches "$blob" "$digest"; then
+            echo "  cached layer ${digest:7:12} fails its digest check, refetching" >&2
+            rm -f "$blob"
+        fi
+
         if [ ! -f "$blob" ]; then
             local blob_tmp="${blob}.tmp"
             curl -fsSL \
@@ -175,6 +294,11 @@ oci_unpack() {
                 echo "Error: failed to download layer ${digest:7:12}" >&2
                 return 1
             }
+            if ! _blob_matches "$blob_tmp" "$digest"; then
+                rm -f "$blob_tmp"
+                echo "Error: layer ${digest:7:12} does not match its manifest digest" >&2
+                return 1
+            fi
             mv "$blob_tmp" "$blob"
         fi
 
@@ -358,8 +482,9 @@ _create_xbps() {
     _xbps_trust_keys "$rootfs" || return 1
     echo "Bootstrapping Void Linux via xbps..."
     # -S syncs the remote repository index first (without it, base-minimal is
-    # "not found" because the local index is empty).
-    xbps-install -S -r "$rootfs" --repository="$repo" -y base-minimal
+    # "not found" because the local index is empty). stdin is /dev/null so a
+    # repo signed by a key the host does not trust fails instead of prompting.
+    xbps-install -S -r "$rootfs" --repository="$repo" -y base-minimal </dev/null
 }
 
 _install_packages() {
@@ -373,7 +498,7 @@ _install_packages() {
     fi
 
     echo "Installing packages: $*"
-    xbps-install -S -r "$rootfs" --repository="$repo" -y "$@"
+    xbps-install -S -r "$rootfs" --repository="$repo" -y "$@" </dev/null
 }
 
 _create_oci() {
@@ -410,18 +535,26 @@ cmd_create() {
         exit 1
     fi
 
+    validate_name "$name"
     local rootfs="$CRT_HOME/$name"
 
-    if [ -d "$rootfs" ]; then
+    if [ -e "$rootfs" ] || [ -L "$rootfs" ]; then
         echo "Chroot '$name' already exists at $rootfs"
         exit 1
     fi
 
     local stored_config="$CRT_CONF_DIR/$name"
+    local marker
+    marker=$(pristine_marker "$name")
     mkdir -p "$rootfs" "$CRT_CONF_DIR" "$CRT_STATE_DIR"
-    trap 'rm -rf "$rootfs" "$stored_config" "$CRT_STATE_DIR/$name.tainted"' ERR
-    # A freshly created rootfs is pristine: clear any stale taint marker.
-    rm -f "$CRT_STATE_DIR/$name.tainted"
+    # Clean up a partial create however it stops. An EXIT trap is used because
+    # an ERR trap does not fire when set -e aborts inside a called function.
+    # Paths are expanded now so the trap does not depend on function locals.
+    # shellcheck disable=SC2064
+    trap "rm -rf -- $(printf '%q ' "$rootfs" "$stored_config" "$marker")" EXIT
+    # No marker until the rootfs is fully built (a stale one is never trusted:
+    # it records the identity of a different directory).
+    rm -f -- "$marker"
 
     if [ -z "$arg" ]; then
         _create_xbps "$rootfs"
@@ -445,7 +578,9 @@ cmd_create() {
         write_config "$stored_config" "$arg"
     fi
 
-    trap - ERR
+    mark_pristine "$name" "$rootfs" \
+        || { echo "Error: could not write the pristine marker for '$name'" >&2; exit 1; }
+    trap - EXIT
     echo "Created: $rootfs ($(du -sh "$rootfs" 2>/dev/null | cut -f1))"
 }
 
@@ -503,6 +638,7 @@ cmd_run() {
         exit 1
     fi
     shift
+    validate_name "$name"
 
     local rootfs="$CRT_HOME/$name"
 
@@ -512,21 +648,42 @@ cmd_run() {
         exit 1
     fi
 
-    # Canonicalise the rootfs once, so a symlinked CRT_HOME component does not
-    # make every later "path escapes rootfs" check fail.
-    local rootfs_real
+    # Canonicalise CRT_HOME and the rootfs once (a symlinked CRT_HOME component
+    # must not make every later "path escapes rootfs" check fail), and require
+    # the rootfs to be the real directory CRT_HOME/<name>, not a symlink alias.
+    local home_real rootfs_real
+    home_real=$(realpath -e -- "$CRT_HOME") \
+        || { echo "Error: cannot resolve CRT_HOME $CRT_HOME" >&2; exit 1; }
     rootfs_real=$(realpath -e -- "$rootfs") \
         || { echo "Error: cannot resolve rootfs path $rootfs" >&2; exit 1; }
+    if [ "$rootfs_real" != "$home_real/$name" ]; then
+        echo "Error: '$rootfs' resolves to $rootfs_real, not $home_real/$name;" >&2
+        echo "  a rootfs must be a real directory directly under CRT_HOME." >&2
+        exit 1
+    fi
     rootfs="$rootfs_real"
 
     # Stored config lives outside every rootfs so a container cannot read or
     # rewrite the config that governs its own (or a later) run. Migrate a legacy
     # in-rootfs config once, by moving it out (never copying, never reading it
-    # from inside the rootfs afterwards).
+    # from inside the rootfs afterwards). Only a regular, non-symlink file is
+    # migrated, and a migrated rootfs is not pristine: its history is unknown.
     local stored_config="$CRT_CONF_DIR/$name"
-    if [ ! -f "$stored_config" ] && [ -f "$rootfs/config" ]; then
+    if [ ! -e "$stored_config" ] && { [ -e "$rootfs/config" ] || [ -L "$rootfs/config" ]; }; then
+        if [ -L "$rootfs/config" ] || [ ! -f "$rootfs/config" ]; then
+            echo "Error: legacy $rootfs/config is not a regular file; refusing to migrate it." >&2
+            echo "  Remove it and write $stored_config yourself." >&2
+            exit 1
+        fi
         mkdir -p "$CRT_CONF_DIR"
         mv -- "$rootfs/config" "$stored_config"
+        if [ -L "$stored_config" ] || [ ! -f "$stored_config" ]; then
+            rm -f -- "$stored_config"
+            echo "Error: migrated config for '$name' is not a regular file; removed it." >&2
+            exit 1
+        fi
+        clear_pristine "$name" \
+            || { echo "Error: cannot clear the pristine marker for '$name'" >&2; exit 1; }
     fi
 
     # Load stored config
@@ -586,47 +743,53 @@ cmd_run() {
     local crt_trusted="/usr/bin:/bin:/usr/sbin:/sbin"
     local crt_binpath="$crt_trusted"
 
-    # Test mode is enabled only when CRT_TEST_MODE is an ABSOLUTE path to a
-    # directory carrying the mocks' marker file. A bare CRT_TEST_MODE=1, a
-    # relative path, or any inherited value that is not a real mocks dir does
-    # nothing. It routes binary resolution through the mocks, allows the chroot
-    # fallback, and skips the findmnt-based ro verification (no real mount
-    # namespace under test).
-    local crt_test=0
-    case "${CRT_TEST_MODE:-}" in
-        /*) if [ -f "${CRT_TEST_MODE}/.crt-mocks" ]; then
-                crt_test=1
-                crt_binpath="${CRT_TEST_MODE}:$crt_trusted"
-            fi ;;
-    esac
+    # Test mode is enabled only when CRT_TEST_MODE names this repo's own
+    # test/mocks directory (resolved from the script's real location; it must
+    # carry the .crt-mocks marker). Any other value — a bare 1, a relative path,
+    # another directory with a marker, or an installed crt with no test dir —
+    # does nothing. It routes binary resolution through the mocks, allows the
+    # chroot fallback, and skips the findmnt-based ro verification.
+    local crt_test=0 crt_mocks="" tm_real
+    if [ -n "${CRT_TEST_MODE:-}" ] && crt_mocks=$(crt_mocks_dir) \
+       && tm_real=$(realpath -e -- "$CRT_TEST_MODE" 2>/dev/null) \
+       && [ "$tm_real" = "$crt_mocks" ]; then
+        crt_test=1
+        crt_binpath="$crt_mocks:$crt_trusted"
+    fi
 
     # Hardened mode runs rootfs binaries (umount, setpriv) after pivot_root while
-    # still privileged, so it can only be trusted on a rootfs that has never been
-    # writable to a container. Enforce that: force the rootfs read-only for this
-    # run, and refuse if it was ever run writable since it was created. The taint
-    # marker lives outside the rootfs, so a container cannot clear it.
-    local taint="$CRT_STATE_DIR/$name.tainted"
+    # still privileged, so it is only trusted on a rootfs that is exactly what
+    # crt create wrote: it requires the pristine marker for this rootfs identity,
+    # forces the rootfs read-only, and requires CRT_HOME to be out of reach of
+    # every non-hardened run. Any non-hardened run deletes the marker first, and
+    # does not start if it cannot.
     if [ "$hardened" = 1 ]; then
         ro_root=1
-        if [ -e "$taint" ]; then
-            echo "Error: '$name' has been run writable since it was created;" >&2
-            echo "  hardened isolation requires a pristine rootfs (its umount/setpriv" >&2
-            echo "  could have been replaced). Recreate it and only run it read-only:" >&2
-            echo "    crt rm $name && crt create $name ...   # then run with --ro-root" >&2
+        if ! is_pristine "$name" "$rootfs"; then
+            echo "Error: '$name' is not pristine: it was run writable, migrated, renamed," >&2
+            echo "  or not made by crt create. Hardened isolation trusts the rootfs's own" >&2
+            echo "  umount/setpriv, so it needs a fresh rootfs that is only run hardened:" >&2
+            echo "    crt rm $name && crt create $name ..." >&2
             exit 1
         fi
-    fi
-    # Any run whose rootfs is writable may modify it, so mark it tainted (outside
-    # the rootfs) before launching. Pristine, hardened (ro) runs never taint.
-    # Skipped under test mode (mocks perform no real writes and rootfs are reused).
-    if [ "$ro_root" != 1 ] && [ "$crt_test" != 1 ]; then
-        mkdir -p "$CRT_STATE_DIR"
-        : > "$taint"
+        check_crt_home_placement "$home_real" || exit 1
+    else
+        clear_pristine "$name" \
+            || { echo "Error: cannot remove the pristine marker for '$name'; not starting." >&2; exit 1; }
     fi
 
-    local UNSHARE
-    UNSHARE=$(PATH="$crt_binpath" command -v unshare) \
-        || { echo "Error: unshare not found on trusted PATH" >&2; exit 1; }
+    # unshare is taken from a fixed absolute list (never a PATH or function
+    # lookup), or from this repo's mocks under test mode.
+    local UNSHARE="" p
+    if [ "$crt_test" = 1 ]; then
+        UNSHARE="$crt_mocks/unshare"
+    else
+        for p in /usr/bin/unshare /bin/unshare /usr/sbin/unshare /sbin/unshare; do
+            if [[ -x "$p" ]]; then UNSHARE=$p; break; fi
+        done
+    fi
+    [[ -n "$UNSHARE" && -x "$UNSHARE" ]] \
+        || { echo "Error: unshare not found in /usr/bin, /bin, /usr/sbin or /sbin" >&2; exit 1; }
 
     # Resolve env entries in the parent, where the caller's environment is visible.
     #   NAME=value  -> passed through as-is
@@ -636,17 +799,17 @@ cmd_run() {
     # so an -e value cannot influence crt's own binary lookup or behavior.
     # A passed-through NODE_CHANNEL_FD is auto-kept only if it names an open fd > 2.
     local -a resolved_envs=()
-    local env_spec name value
+    local env_spec ename value
     for env_spec in "${all_envs[@]}"; do
         if [[ "$env_spec" == *=* ]]; then
-            resolved_envs+=("$env_spec"); name=${env_spec%%=*}; value=${env_spec#*=}
+            resolved_envs+=("$env_spec"); ename=${env_spec%%=*}; value=${env_spec#*=}
         elif [ -n "${!env_spec+x}" ]; then
-            name=$env_spec; value=${!env_spec}; resolved_envs+=("$name=$value")
+            ename=$env_spec; value=${!env_spec}; resolved_envs+=("$ename=$value")
         else
             echo "Warning: -e $env_spec: not set in environment, skipping" >&2
             continue
         fi
-        if [ "$name" = NODE_CHANNEL_FD ] && [[ "$value" =~ ^[0-9]+$ ]] \
+        if [ "$ename" = NODE_CHANNEL_FD ] && [[ "$value" =~ ^[0-9]+$ ]] \
            && [ "$value" -gt 2 ] && [ -e "/proc/self/fd/$value" ]; then
             all_keepfds+=("$value")
         fi
@@ -898,18 +1061,20 @@ cmd_rm() {
         echo "Usage: crt rm <name>"
         exit 1
     fi
+    validate_name "$name"
 
     local rootfs="$CRT_HOME/$name"
 
-    if [ ! -d "$rootfs" ]; then
+    if [ ! -d "$rootfs" ] || [ -L "$rootfs" ]; then
         echo "Error: Chroot '$name' not found"
         exit 1
     fi
 
     echo "Removing $rootfs..."
-    rm -rf "$rootfs"
-    # Remove the out-of-rootfs stored config and taint marker too.
-    rm -f "$CRT_CONF_DIR/$name" "$CRT_STATE_DIR/$name.tainted"
+    rm -rf -- "$rootfs"
+    # Remove the out-of-rootfs stored config and state too (.tainted is the
+    # pre-pristine-marker state file, removed if a legacy one is left).
+    rm -f -- "$CRT_CONF_DIR/$name" "$(pristine_marker "$name")" "$CRT_STATE_DIR/$name.tainted"
     echo "Removed chroot '$name'"
 }
 
@@ -926,6 +1091,7 @@ cmd_export() {
         echo "  crt export ubuntu /usr/bin/python3 python"
         exit 1
     fi
+    validate_name "$name"
 
     local rootfs="$CRT_HOME/$name"
 
@@ -1106,11 +1272,14 @@ urandom, tty, a fresh devpts, private shm) is built; the host /dev is never
 exposed. File descriptors above stderr are closed except --keep-fd entries and,
 when -e NODE_CHANNEL_FD is passed, that fd (so Node's IPC channel works).
 
-Hardened mode forces the rootfs read-only and refuses any rootfs that has been
-run writable since it was created (its umount/setpriv are trusted). Create a
-rootfs for untrusted code and only ever run it hardened; recreate it if a
-writable run tainted it. Stored config lives outside every rootfs
-(CRT_HOME/.config/<name>), so a container cannot alter its own config.
+Hardened mode trusts the rootfs's own umount/setpriv, so it runs only on a
+pristine rootfs: crt create writes a marker (CRT_HOME/.state/<name>.pristine,
+keyed on the rootfs's path and inode), any non-hardened run deletes it, and a
+hardened run requires it and forces the rootfs read-only. Create a rootfs for
+untrusted code and only ever run it hardened. Stored config lives outside every
+rootfs (CRT_HOME/.config/<name>). CRT_HOME must be outside $HOME, /tmp and any
+mount source in a stored config (the default /home/crt is), or hardened runs
+are refused. Names: letters, digits, '.', '_', '-', starting alphanumeric.
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)
