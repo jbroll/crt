@@ -1,0 +1,4 @@
+#!/bin/sh
+# Mock pivot_root: always fail so cmd_run falls back to chroot (no real namespace in tests)
+[ -n "$CRT_MOCK_LOG" ] && echo "pivot_root $*" >> "$CRT_MOCK_LOG"
+exit 1

@@ -1,3 +1,4 @@
 #!/bin/sh
-# Mock mount: no-op (namespace not available in tests)
+# Mock mount: optionally log args, then no-op (namespace not available in tests)
+[ -n "$CRT_MOCK_LOG" ] && echo "mount $*" >> "$CRT_MOCK_LOG"
 exit 0

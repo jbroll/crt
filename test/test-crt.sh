@@ -435,4 +435,171 @@ else
     Pass  # skip: no passwordless sudo available
 fi
 
+# ── read_config: isolation directives ────────────────────────────────────────
+echo "# read_config isolation directives"
+
+read_cfg_field() {
+    # $1 = config text, $2 = shell expression printed after read_config
+    local text="$1" expr="$2"
+    printf '%s' "$text" > "$CONF"
+    bash -c "
+$(awk '/^read_config\(\)/,/^\}/' "$CRT")
+config_image='' config_memory='' config_cpus=''
+config_net='' config_home='' config_tmp='' config_envclean='' config_root=''
+config_mounts=() config_envs=() config_packages=()
+read_config '$CONF'
+$expr
+"
+}
+
+Test "read_config: net directive"
+CompareArgs "$(read_cfg_field 'net none
+' 'echo "$config_net"')" "none"
+
+Test "read_config: home directive"
+CompareArgs "$(read_cfg_field 'home no
+' 'echo "$config_home"')" "no"
+
+Test "read_config: tmp directive"
+CompareArgs "$(read_cfg_field 'tmp private
+' 'echo "$config_tmp"')" "private"
+
+Test "read_config: env-clean directive"
+CompareArgs "$(read_cfg_field 'env-clean yes
+' 'echo "$config_envclean"')" "yes"
+
+Test "read_config: root directive"
+CompareArgs "$(read_cfg_field 'root ro
+' 'echo "$config_root"')" "ro"
+
+Test "read_config: packages single"
+CompareArgs "$(read_cfg_field 'packages nodejs
+' 'echo "${#config_packages[@]} ${config_packages[*]}"')" "1 nodejs"
+
+Test "read_config: packages multiple on one line"
+CompareArgs "$(read_cfg_field 'packages nodejs python3 git
+' 'echo "${#config_packages[@]}"')" "3"
+
+Test "read_config: packages repeatable across lines"
+CompareArgs "$(read_cfg_field 'packages nodejs
+packages git
+' 'echo "${#config_packages[@]}"')" "2"
+
+# ── cmd_run: flag parsing & generated unshare/mount calls ─────────────────────
+echo "# cmd_run isolation flags"
+
+make_rootfs isoenv
+printf '' > "$CRT_HOME/isoenv/config"
+
+# Run crt with a mock-call log and print the log to stdout.
+run_logged() {
+    local log
+    log=$(mktemp)
+    CRT_MOCK_LOG="$log" "$CRT" run "$@" >/dev/null 2>&1
+    cat "$log"
+    rm -f "$log"
+}
+
+Test "run: default does not add --net to unshare"
+if run_logged isoenv true | grep -q "^unshare .*--net"; then Fail; else Pass; fi
+
+Test "run: --net none adds --net to unshare"
+if run_logged --net none isoenv true | grep -q '^unshare .*--net'; then Pass; else Fail; fi
+
+Test "run: net directive from config adds --net"
+printf 'net none\n' > "$CRT_HOME/isoenv/config"
+if run_logged isoenv true | grep -q '^unshare .*--net'; then Pass; else Fail; fi
+printf '' > "$CRT_HOME/isoenv/config"
+
+Test "run: --net host flag overrides config net none"
+printf 'net none\n' > "$CRT_HOME/isoenv/config"
+if run_logged --net host isoenv true | grep -q '^unshare .*--net'; then Fail; else Pass; fi
+printf '' > "$CRT_HOME/isoenv/config"
+
+Test "run: default binds \$HOME"
+if run_logged isoenv true | grep -q -- "^mount --bind $HOME "; then Pass; else Fail; fi
+
+Test "run: --no-home skips the \$HOME bind"
+if run_logged --no-home isoenv true | grep -q -- "^mount --bind $HOME "; then Fail; else Pass; fi
+
+Test "run: default binds host /tmp"
+if run_logged isoenv true | grep -q -- "^mount --bind /tmp "; then Pass; else Fail; fi
+
+Test "run: --tmp private mounts a tmpfs on /tmp"
+log=$(run_logged --tmp private isoenv true)
+if echo "$log" | grep -q -- "^mount -t tmpfs tmpfs .*/tmp" && \
+   ! echo "$log" | grep -q -- "^mount --bind /tmp "; then Pass; else Fail; fi
+
+Test "run: -v host:container:ro triggers a read-only remount"
+tmpsrc=$(mktemp -d)
+if run_logged -v "$tmpsrc:/data:ro" isoenv true | grep -q -- "^mount -o remount,bind,ro"; then Pass; else Fail; fi
+rmdir "$tmpsrc"
+
+Test "run: rw bind does not trigger a read-only remount"
+tmpsrc=$(mktemp -d)
+if run_logged -v "$tmpsrc:/data" isoenv true | grep -q -- "^mount -o remount,bind,ro"; then Fail; else Pass; fi
+rmdir "$tmpsrc"
+
+Test "run: --ro-root remounts the rootfs read-only"
+if run_logged --ro-root isoenv true | grep -q -- "^mount -o remount,bind,ro $CRT_HOME/isoenv$"; then Pass; else Fail; fi
+
+Test "run: invalid --net value is rejected"
+err=$("$CRT" run --net bogus isoenv true 2>&1 || true)
+if echo "$err" | grep -q "invalid net mode"; then Pass; else Fail; fi
+
+Test "run: invalid --tmp value is rejected"
+err=$("$CRT" run --tmp bogus isoenv true 2>&1 || true)
+if echo "$err" | grep -q "invalid tmp mode"; then Pass; else Fail; fi
+
+Test "run: long --env flag works"
+result=$("$CRT" run --env SHADE=green isoenv printenv SHADE 2>/dev/null)
+CompareArgs "$result" "green"
+
+Test "run: long --volume flag is accepted"
+tmpsrc=$(mktemp -d)
+if run_logged --volume "$tmpsrc:/data" isoenv true | grep -q -- "^mount --rbind $tmpsrc "; then Pass; else Fail; fi
+rmdir "$tmpsrc"
+
+# ── cmd_run: clean environment ────────────────────────────────────────────────
+echo "# cmd_run clean environment"
+
+Test "run: default inherits caller environment"
+result=$(CALLER_VAR=leaked "$CRT" run isoenv printenv CALLER_VAR 2>/dev/null)
+CompareArgs "$result" "leaked"
+
+Test "run: --clean-env drops caller environment"
+result=$(CALLER_VAR=leaked "$CRT" run --clean-env isoenv sh -c 'echo "${CALLER_VAR:-unset}"' 2>/dev/null)
+CompareArgs "$result" "unset"
+
+Test "run: --clean-env sets a minimal HOME"
+result=$("$CRT" run --clean-env isoenv sh -c 'echo "$HOME"' 2>/dev/null)
+CompareArgs "$result" "/tmp"
+
+Test "run: --clean-env sets a minimal PATH"
+result=$("$CRT" run --clean-env isoenv sh -c 'echo "$PATH"' 2>/dev/null)
+CompareArgs "$result" "/usr/bin:/bin:/usr/local/bin"
+
+Test "run: -e NAME passes the caller's value through a clean env"
+result=$(TOKEN=abc123 "$CRT" run --clean-env -e TOKEN isoenv printenv TOKEN 2>/dev/null)
+CompareArgs "$result" "abc123"
+
+Test "run: -e NAME=val still works with a clean env"
+result=$("$CRT" run --clean-env -e SHAPE=round isoenv printenv SHAPE 2>/dev/null)
+CompareArgs "$result" "round"
+
+Test "run: -e for an unset var warns and is skipped"
+warn=$("$CRT" run --clean-env -e DEFINITELY_UNSET_VAR isoenv true 2>&1 >/dev/null || true)
+if echo "$warn" | grep -q "not set in environment"; then Pass; else Fail; fi
+
+# ── cmd_run: inherited file descriptors ───────────────────────────────────────
+echo "# cmd_run inherited fds"
+
+Test "run: an inherited fd survives into the command"
+result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'fd-payload' 2>/dev/null)
+CompareArgs "$result" "fd-payload"
+
+Test "run: an inherited fd survives a clean env too"
+result=$("$CRT" run --clean-env isoenv sh -c 'cat <&3' 3<<<'clean-fd' 2>/dev/null)
+CompareArgs "$result" "clean-fd"
+
 TestDone

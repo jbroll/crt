@@ -209,10 +209,17 @@ read_config() {
     config_envs=()
     config_memory=""
     config_cpus=""
+    config_net=""
+    config_home=""
+    config_tmp=""
+    config_envclean=""
+    config_root=""
+    config_packages=()
 
     [ -f "$config_file" ] || return 0
 
     local key val
+    local -a _pkgs
     while read -r key val; do
         case "$key" in
             '#'*|'') continue ;;
@@ -222,11 +229,17 @@ read_config() {
             continue
         fi
         case "$key" in
-            image)   config_image="$val" ;;
-            mount)   config_mounts+=("$val") ;;
-            env)     config_envs+=("$val") ;;
-            memory)  config_memory="$val" ;;
-            cpus)    config_cpus="$val" ;;
+            image)     config_image="$val" ;;
+            mount)     config_mounts+=("$val") ;;
+            env)       config_envs+=("$val") ;;
+            memory)    config_memory="$val" ;;
+            cpus)      config_cpus="$val" ;;
+            net)       config_net="$val" ;;
+            home)      config_home="$val" ;;
+            tmp)       config_tmp="$val" ;;
+            env-clean) config_envclean="$val" ;;
+            root)      config_root="$val" ;;
+            packages)  read -ra _pkgs <<< "$val"; config_packages+=("${_pkgs[@]}") ;;
         esac
     done < "$config_file"
 }
@@ -306,6 +319,20 @@ _create_xbps() {
     xbps-install -r "$rootfs" --repository="$repo" -y base-minimal
 }
 
+_install_packages() {
+    local rootfs="$1"; shift
+    [ $# -eq 0 ] && return 0
+    local repo="${VOID_REPO:-https://repo-default.voidlinux.org/current}"
+
+    if ! command -v xbps-install >/dev/null 2>&1; then
+        echo "Error: xbps-install not found; cannot install packages: $*" >&2
+        return 1
+    fi
+
+    echo "Installing packages: $*"
+    xbps-install -r "$rootfs" --repository="$repo" -y "$@"
+}
+
 _create_oci() {
     local image="$1"
     local rootfs="$2"
@@ -336,7 +363,7 @@ cmd_create() {
         echo "Usage: crt create <name> [image|config-file]"
         echo "  no second arg:   bootstrap Void Linux via xbps"
         echo "  image reference: pull from OCI registry (e.g. ubuntu:22.04)"
-        echo "  config file:     read directives from file (image, mount, env, memory, cpus)"
+        echo "  config file:     read directives from file (image, packages, mount, env, memory, cpus, net, home, tmp, env-clean, root)"
         exit 1
     fi
 
@@ -357,12 +384,16 @@ cmd_create() {
         write_config "$stored_config" "void"
     elif [ -f "$arg" ]; then
         local config_image="" config_memory="" config_cpus=""
-        local -a config_mounts=() config_envs=()
+        local config_net="" config_home="" config_tmp="" config_envclean="" config_root=""
+        local -a config_mounts=() config_envs=() config_packages=()
         read_config "$arg"
         if [ -z "$config_image" ] || [ "$config_image" = "void" ]; then
             _create_xbps "$rootfs"
+            _install_packages "$rootfs" "${config_packages[@]}"
         else
             _create_oci "$config_image" "$rootfs"
+            [ ${#config_packages[@]} -gt 0 ] && \
+                echo "Warning: 'packages' directive ignored for OCI image '$config_image'" >&2
         fi
         cp "$arg" "$stored_config"
     else
@@ -383,30 +414,49 @@ cmd_enter() {
 }
 
 cmd_run() {
-    OPTIND=1
-    local opt
     local -a flag_mounts=() flag_envs=()
     local flag_memory="" flag_cpus=""
+    local flag_net="" flag_home="" flag_tmp="" flag_cleanenv="" flag_roroot=""
 
-    while getopts ':v:e:m:c:' opt; do
-        case "$opt" in
-            v) flag_mounts+=("$OPTARG") ;;
-            e) flag_envs+=("$OPTARG") ;;
-            m) flag_memory="$OPTARG" ;;
-            c) flag_cpus="$OPTARG" ;;
-            :) echo "Error: -$OPTARG requires an argument" >&2; exit 1 ;;
-            ?) echo "Error: unknown option -$OPTARG" >&2; exit 1 ;;
+    # Manual parser: original short flags (-v -e -m -c) plus long flags.
+    # Value-taking short flags accept an attached (-vX) or separate (-v X) form.
+    local val
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--volume) val="$2"; [ $# -ge 2 ] || { echo "Error: $1 requires an argument" >&2; exit 1; }
+                         flag_mounts+=("$val"); shift 2 ;;
+            -e|--env)    val="$2"; [ $# -ge 2 ] || { echo "Error: $1 requires an argument" >&2; exit 1; }
+                         flag_envs+=("$val"); shift 2 ;;
+            -m|--memory) val="$2"; [ $# -ge 2 ] || { echo "Error: $1 requires an argument" >&2; exit 1; }
+                         flag_memory="$val"; shift 2 ;;
+            -c|--cpus)   val="$2"; [ $# -ge 2 ] || { echo "Error: $1 requires an argument" >&2; exit 1; }
+                         flag_cpus="$val"; shift 2 ;;
+            -v*) flag_mounts+=("${1#-v}"); shift ;;
+            -e*) flag_envs+=("${1#-e}"); shift ;;
+            -m*) flag_memory="${1#-m}"; shift ;;
+            -c*) flag_cpus="${1#-c}"; shift ;;
+            --net)  [ $# -ge 2 ] || { echo "Error: --net requires an argument" >&2; exit 1; }
+                    flag_net="$2"; shift 2 ;;
+            --tmp)  [ $# -ge 2 ] || { echo "Error: --tmp requires an argument" >&2; exit 1; }
+                    flag_tmp="$2"; shift 2 ;;
+            --no-home)   flag_home="no"; shift ;;
+            --clean-env) flag_cleanenv="yes"; shift ;;
+            --ro-root)   flag_roroot="ro"; shift ;;
+            --) shift; break ;;
+            -*) echo "Error: unknown option $1" >&2; exit 1 ;;
+            *)  break ;;
         esac
     done
-    shift $((OPTIND - 1))
 
     local name="$1"
-    shift
 
     if [ -z "$name" ]; then
-        echo "Usage: crt run [-v host:container] [-e KEY=val] [-m SIZE] [-c FLOAT] <name> [cmd...]"
+        echo "Usage: crt run [-v h:c[:ro]] [-e NAME[=val]] [-m SIZE] [-c FLOAT]" >&2
+        echo "               [--net none|host] [--no-home] [--tmp private|host]" >&2
+        echo "               [--clean-env] [--ro-root] <name> [cmd...]" >&2
         exit 1
     fi
+    shift
 
     local rootfs="$CRT_HOME/$name"
 
@@ -418,29 +468,69 @@ cmd_run() {
 
     # Load stored config
     local config_image="" config_memory="" config_cpus=""
-    local -a config_mounts=() config_envs=()
-    read_config "$CRT_HOME/$name/config"
+    local config_net="" config_home="" config_tmp="" config_envclean="" config_root=""
+    local -a config_mounts=() config_envs=() config_packages=()
+    read_config "$rootfs/config"
 
     # Merge: config first, flags override/extend
     local -a all_mounts=("${config_mounts[@]}" "${flag_mounts[@]}")
     local -a all_envs=("${config_envs[@]}" "${flag_envs[@]}")
     local memory="${flag_memory:-$config_memory}"
     local cpus="${flag_cpus:-$config_cpus}"
+    local net_mode="${flag_net:-${config_net:-host}}"
+    local home_mode="${flag_home:-${config_home:-yes}}"
+    local tmp_mode="${flag_tmp:-${config_tmp:-host}}"
+    local clean_mode="${flag_cleanenv:-${config_envclean:-no}}"
+    local root_mode="${flag_roroot:-${config_root:-rw}}"
 
     # Validate mount specs
     local spec
     for spec in "${all_mounts[@]}"; do
         if [[ "$spec" != *:* ]]; then
-            echo "Error: mount '$spec' must be host:container" >&2
+            echo "Error: mount '$spec' must be host:container[:ro]" >&2
             exit 1
         fi
     done
 
-    # Apply env vars (inherited through exec unshare automatically)
+    # Normalise modes to booleans passed into the namespace
+    local no_home=0 private_tmp=0 net_none=0 ro_root=0 clean_env=0
+    case "$home_mode" in no|none|false|0) no_home=1 ;; yes|true|1|"") : ;;
+        *) echo "Error: invalid home mode '$home_mode' (use yes|no)" >&2; exit 1 ;; esac
+    case "$tmp_mode" in private|priv) private_tmp=1 ;; host|shared|"") : ;;
+        *) echo "Error: invalid tmp mode '$tmp_mode' (use private|host)" >&2; exit 1 ;; esac
+    case "$net_mode" in none|off|no) net_none=1 ;; host|""|share) : ;;
+        *) echo "Error: invalid net mode '$net_mode' (use none|host)" >&2; exit 1 ;; esac
+    case "$root_mode" in ro|readonly) ro_root=1 ;; rw|""|readwrite) : ;;
+        *) echo "Error: invalid root mode '$root_mode' (use ro|rw)" >&2; exit 1 ;; esac
+    case "$clean_mode" in yes|true|1|clean) clean_env=1 ;; no|false|0|"") : ;;
+        *) echo "Error: invalid env-clean mode '$clean_mode' (use yes|no)" >&2; exit 1 ;; esac
+
+    # Resolve env entries in the parent, where the caller's environment is visible.
+    #   NAME=value  -> passed through as-is
+    #   NAME        -> substituted with the caller's current value (skipped if unset)
+    local -a resolved_envs=()
     local env_spec
     for env_spec in "${all_envs[@]}"; do
-        export "$env_spec"
+        if [[ "$env_spec" == *=* ]]; then
+            resolved_envs+=("$env_spec")
+        elif [ -n "${!env_spec+x}" ]; then
+            resolved_envs+=("$env_spec=${!env_spec}")
+        else
+            echo "Warning: -e $env_spec: not set in environment, skipping" >&2
+        fi
     done
+
+    # Minimal environment used only when --clean-env is in effect.
+    local minpath="/usr/bin:/bin:/usr/local/bin"
+    local minhome="/tmp"
+
+    if [ "$clean_env" = 0 ]; then
+        # Inherit: export resolved vars so the command sees them, no positional pass.
+        local e
+        # shellcheck disable=SC2163  # each entry is a NAME=value assignment, not a var name
+        for e in "${resolved_envs[@]}"; do export "$e"; done
+        resolved_envs=()
+    fi
 
     # Apply cgroup limits before exec
     _CRT_CGROUP=""
@@ -451,30 +541,111 @@ cmd_run() {
     local workdir
     workdir="$(pwd)"
 
+    local -a unshare_args=(--user --map-root-user --mount --pid --uts --ipc)
+    [ "$net_none" = 1 ] && unshare_args+=(--net)
+    unshare_args+=(-f)
+
     # shellcheck disable=SC2016
-    unshare --user --map-root-user --mount --pid --uts --ipc -f \
+    unshare "${unshare_args[@]}" \
         /bin/bash -c '
-            rootfs=$1; userhome=$2; workdir=$3; nmounts=$4; shift 4
-            mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" "$rootfs/tmp" "$rootfs/etc"
-            touch "$rootfs/etc/resolv.conf"
-            mount -t proc proc "$rootfs/proc"
-            mount -t sysfs sysfs "$rootfs/sys"
-            mount --bind /dev "$rootfs/dev"
-            mount --bind /dev/pts "$rootfs/dev/pts"
-            mount --bind /etc/resolv.conf "$rootfs/etc/resolv.conf"
-            mkdir -p "$rootfs$userhome"
-            mount --bind "$userhome" "$rootfs$userhome"
-            mount --bind /tmp "$rootfs/tmp"
+            set +e
+            rootfs=$1; userhome=$2; workdir=$3
+            no_home=$4; private_tmp=$5; net_none=$6; ro_root=$7; clean_env=$8
+            minpath=$9; shift 9
+            minhome=$1; nmounts=$2; shift 2
+
+            mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" \
+                     "$rootfs/tmp" "$rootfs/etc" "$rootfs/oldroot"
+            touch "$rootfs/etc/resolv.conf" 2>/dev/null || true
+            mount --make-rprivate / 2>/dev/null || true
+            # Make the rootfs a mount point first, so every submount below lands
+            # on top of it and pivot_root can later use it as the new root.
+            mount --bind "$rootfs" "$rootfs" 2>/dev/null || true
+            mount -t proc proc "$rootfs/proc" 2>/dev/null || true
+            mount --bind /sys "$rootfs/sys" 2>/dev/null \
+                || mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+            mount --bind /dev "$rootfs/dev" 2>/dev/null || true
+            mount --bind /dev/pts "$rootfs/dev/pts" 2>/dev/null || true
+            mount --bind /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+
+            if [ "$private_tmp" = 1 ]; then
+                mount -t tmpfs tmpfs "$rootfs/tmp" 2>/dev/null || true
+            else
+                mount --bind /tmp "$rootfs/tmp" 2>/dev/null || true
+            fi
+
+            if [ "$no_home" != 1 ]; then
+                mkdir -p "$rootfs$userhome"
+                mount --bind "$userhome" "$rootfs$userhome" 2>/dev/null || true
+            fi
+
             i=0
             while [ "$i" -lt "$nmounts" ]; do
                 spec=$1; shift; i=$((i+1))
-                host="${spec%%:*}"; container="${spec#*:}"
+                mode=rw
+                case "$spec" in
+                    *:*:ro) mode=ro; spec=${spec%:ro} ;;
+                    *:*:rw) spec=${spec%:rw} ;;
+                esac
+                host=${spec%%:*}; container=${spec#*:}
                 mkdir -p "$rootfs$container"
-                mount --bind "$host" "$rootfs$container"
+                if ! mount --rbind "$host" "$rootfs$container" 2>/dev/null; then
+                    echo "crt: bind mount failed: $host -> $container" >&2
+                    exit 1
+                fi
+                if [ "$mode" = ro ]; then
+                    mount -o remount,bind,ro=recursive "$rootfs$container" 2>/dev/null \
+                        || mount -o remount,bind,ro "$rootfs$container" 2>/dev/null || true
+                    # Fail closed: refuse to run if any submount is still writable.
+                    bad=$(awk -v t="$rootfs$container" '"'"'
+                        $5==t || index($5,t"/")==1 {
+                            if ($6 !~ /(^|,)ro(,|$)/) print $5
+                        }'"'"' /proc/self/mountinfo 2>/dev/null)
+                    if [ -n "$bad" ]; then
+                        echo "crt: read-only bind not enforced: $bad" >&2
+                        exit 1
+                    fi
+                fi
             done
-            exec chroot "$rootfs" /bin/sh -c \
-                '"'"'cd "$1" 2>/dev/null || cd /; shift; exec "$@"'"'"' -- "$workdir" "$@"
-        ' -- "$rootfs" "$HOME" "$workdir" "${#all_mounts[@]}" "${all_mounts[@]}" "$@"
+
+            if [ "$net_none" = 1 ]; then
+                ip link set lo up 2>/dev/null || true
+            fi
+
+            if [ "$ro_root" = 1 ]; then
+                mount -o remount,bind,ro "$rootfs" 2>/dev/null || true
+            fi
+
+            # POSIX-sh payload (runs under the rootfs /bin/sh, which may be dash):
+            # cd into the work dir, then optionally start from a clean environment.
+            # In the clean case the remaining args are  NAME=val... cmd args...  and
+            # env(1) itself stops treating args as assignments at the first non-NAME=val
+            # word, so no count is needed.
+            payload='"'"'
+                wd=$1; clean=$2; mp=$3; mh=$4; shift 4
+                cd "$wd" 2>/dev/null || cd /
+                if [ "$clean" = 1 ]; then
+                    exec env -i "PATH=$mp" "HOME=$mh" "$@"
+                else
+                    exec "$@"
+                fi
+            '"'"'
+
+            cd "$rootfs" 2>/dev/null || cd /
+            if pivot_root . oldroot 2>/dev/null; then
+                umount -l /oldroot 2>/dev/null || true
+                rmdir /oldroot 2>/dev/null || true
+                exec /bin/sh -c "$payload" crt \
+                    "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
+            else
+                # No real mount namespace (e.g. test mocks): fall back to chroot.
+                exec chroot "$rootfs" /bin/sh -c "$payload" crt \
+                    "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
+            fi
+        ' -- "$rootfs" "$HOME" "$workdir" \
+            "$no_home" "$private_tmp" "$net_none" "$ro_root" "$clean_env" \
+            "$minpath" "$minhome" "${#all_mounts[@]}" "${all_mounts[@]}" \
+            "${resolved_envs[@]}" "$@"
     local _rc
     _rc=$?
     [ -n "${_CRT_CGROUP:-}" ] && rmdir "$_CRT_CGROUP" 2>/dev/null || true
@@ -684,11 +855,25 @@ Usage:
   crt create <name>               Bootstrap Void Linux rootfs (xbps)
   crt create <name> [image]       Pull rootfs from OCI registry
   crt enter <name>                Interactive shell
-  crt run <name> <cmd> [args...]  Run command in isolated environment
+  crt run [opts] <name> <cmd...>  Run command in isolated environment
   crt list                        List chroots
   crt rm <name>                   Remove chroot
   crt export <name> <binary>      Create host wrapper for binary
   crt setup                       Delegate cgroup to your user (run with sudo)
+
+run options (flags override the stored config):
+  -v, --volume h:c[:ro]   Bind mount host->container; :ro makes it read-only
+  -e, --env NAME[=val]    Set env var; NAME alone passes the caller's value through
+  -m, --memory SIZE       Memory limit (e.g. 256M, 2G)
+  -c, --cpus FLOAT        CPU limit (e.g. 1.5)
+      --net none|host     Network: none = new net namespace, loopback only (default host)
+      --no-home           Do not bind $HOME into the container
+      --tmp private|host  /tmp: private tmpfs, or the host /tmp bind (default host)
+      --clean-env         Start from an empty env plus a minimal PATH and HOME
+      --ro-root           Mount the rootfs read-only
+
+The command runs with the caller's open file descriptors (>2) intact, so a
+parent's inherited IPC fd (e.g. Node's NODE_CHANNEL_FD) works.
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)
@@ -696,15 +881,16 @@ Environment:
   VOID_REPO   Void Linux package repo (default: https://repo-default.voidlinux.org/current)
 
 Runtime deps:
-  xbps-install  required for: crt create <name>
-  curl jq tar   required for: crt create <name> <image>
-  unshare chroot  required for: crt run / crt enter
+  xbps-install       required for: crt create <name> and the packages directive
+  curl jq tar        required for: crt create <name> <image>
+  unshare pivot_root chroot  required for: crt run / crt enter
 
 Examples:
   crt create void-env
   crt create ubuntu ubuntu:22.04
   crt create alpine ghcr.io/library/alpine:3.19
   crt run ubuntu apt install -y perl python3
+  crt run --net none --no-home --tmp private --clean-env sandbox node script.js
   crt export ubuntu perl
   crt enter ubuntu
 EOF
