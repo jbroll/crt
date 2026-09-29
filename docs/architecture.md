@@ -10,8 +10,13 @@ Everything lives in one file, `crt`. Command dispatch is a `case` statement
 at the bottom mapping each subcommand to a `cmd_*` function. Helpers
 (`parse_image_ref`, `oci_token`, `oci_manifest`, `oci_unpack`, `parse_memory`,
 `read_config`, `write_config`, `apply_cgroup`) sit above the `cmd_*`
-functions they support. No build step, no other files needed at runtime —
-`cp crt /usr/local/bin/crt` is the whole install.
+functions they support. No build step, no other files needed at runtime;
+`crt install` copies the script itself into place (see
+[Install layout](#install-layout)).
+
+`CRT_HOME` and the paths derived from it are resolved once, just before
+dispatch (`resolve_crt_home`), after test mode is known, so a test sysroot can
+stand in for `/data/crt`.
 
 `read_config` populates `config_*` variables in the caller's scope via bash
 dynamic scoping; callers declare the matching locals before calling it. This
@@ -281,7 +286,8 @@ line in any stored config. Before every hardened run,
 `check_crt_home_placement` compares `realpath(CRT_HOME)` with each of those
 paths (at or under, in either direction; `/` overlaps everything) and
 refuses on any overlap, telling the operator to move `CRT_HOME` outside
-`$HOME` and `/tmp`. The default `/home/crt` satisfies this. A `CRT_HOME`
+`$HOME` and `/tmp`. `/data/crt/home/<user>` and `/home/crt` satisfy this.
+`crt doctor` reports the same overlaps without running anything. A `CRT_HOME`
 under `$HOME` or `/tmp` still works for non-hardened runs. This keeps the
 common paths a default run exposes away from `CRT_HOME`; it is not a defense
 against a default run, which has the user's authority regardless (above).
@@ -309,6 +315,90 @@ own in case either is a symlink out of `CRT_HOME`.
   with an allow-list, would close it; `crt` does neither, because the
   invoking environment is trusted.
 
+## Install layout
+
+On a shared host each user gets their own `CRT_HOME` under a root-owned
+prefix, default `/data/crt`:
+
+```
+/data/crt/              root, 755
+  bin/crt               root, 755; /usr/local/bin/crt links here
+  home/                 root, 755
+    <user>/             owned by <user>, 700: that user's CRT_HOME
+```
+
+The pieces follow from the trust model:
+
+- **Per-user, 700 `CRT_HOME`.** A default run has its user's authority, so
+  it can change any rootfs that user owns. Separate owners mean a default run
+  as `john` cannot touch the hardened rootfs of `s-ci`. The trust rule
+  ("never run untrusted code in default mode as the same user") then applies
+  per user rather than to the whole host.
+- **Outside every `$HOME`.** Service accounts often have homes on the same
+  disk (`s-ci` has `/data/ci`), so the layout keeps `CRT_HOME` in its own
+  subtree rather than under the home directory, which a default run binds.
+  `crt setup` warns when a user's home would contain their `CRT_HOME`.
+- **Root-owned `home/`.** Users cannot create, rename or replace entries in
+  it, so no one can plant a directory or symlink under another user's name.
+  `setup` refuses an existing `home/<user>` that is a symlink or not a
+  directory.
+- **Root-owned `bin/crt`.** The script is what enforces hardened mode. A copy
+  a user owns could be edited by any default run as that user, and a later
+  hardened run would execute the edited copy.
+
+`crt install` copies the running script (resolved with `realpath`) to a
+temporary file in `bin/`, sets root ownership and 755, and renames it over
+`bin/crt` with `mv -T`, so there is never a moment where `bin/crt` is
+user-owned or partially written. It skips the copy when the content is the
+same (sha256), which makes it idempotent. `/usr/local/bin/crt` becomes a
+symlink to it, replacing a regular file left by an older `cp` install.
+Before creating anything, `check_root_only_path` walks from the prefix's
+parent up to `/` (after `realpath`) and refuses if any directory is not owned
+by root or is group- or other-writable without the sticky bit: a user who
+could rename a parent could swap the installed tree.
+
+`crt setup` looks every named user up with `getent passwd` before changing
+anything, so one unknown name aborts the whole run with no side effects. It
+takes users from its arguments, falling back to `SUDO_USER`. The home
+directory it compares against comes from the passwd entry, not from the
+environment, since under `sudo` `$HOME` may be root's. When the prefix does
+not exist, setup only delegates cgroups, and the user keeps `/home/crt`.
+
+`CRT_HOME` resolution is `$CRT_HOME`, then `/data/crt/home/$(id -un)` if it
+exists, then `/home/crt`. The layout directory has to exist before it is
+used, so hosts without `/data/crt` are unaffected. `id -un` is used instead of
+`$USER`, which runit and `su` may leave unset or stale. A non-default
+`--prefix` is not searched; those users set `CRT_HOME`. `CRT_BIN` defaults to
+`$CRT_HOME/bin` only when the layout was picked, so an existing
+`CRT_HOME=/x` setup keeps its wrappers in `/home/crt/bin`.
+
+Root-only commands (`install`, `setup`) reset `PATH` to the trusted
+`/usr/bin:/bin:/usr/sbin:/sbin`, like `cmd_run`.
+
+### crt doctor
+
+`crt doctor` runs the checks a hardened run would make, without running
+anything in a rootfs, and exits 1 on a failure. A harness calls it before
+creating a rootfs:
+
+- `CRT_HOME` owned by the caller and not group- or other-writable (another
+  user who can write it can change a rootfs), or, if missing, a writable
+  parent;
+- the `check_crt_home_placement` overlaps, from the same
+  `crt_home_exposures` list;
+- `unshare --user --map-root-user --mount --pid -f true` succeeds, using the
+  same fixed-path `unshare` as `cmd_run` (`find_unshare`).
+
+The cgroup probe mirrors `apply_cgroup`: cgroup v2, a writable
+`user-<uid>`, `memory` in its `cgroup.controllers`, then a child cgroup
+where it writes `memory.max` and moves a subshell in. The last step catches
+the kernel's delegation rule: moving a process needs write access to the
+`cgroup.procs` of the common ancestor of the source and destination cgroups.
+A process started outside `user-<uid>` (for example in the root cgroup) has
+that ancestor owned by root, so it cannot join its own delegated cgroup, and
+`apply_cgroup` warns and runs without limits. Limits are not needed for
+hardened isolation, so the probe only warns unless `--limits` is given.
+
 ## Resource limits (cgroups)
 
 `apply_cgroup` runs in the parent, before `exec unshare`, so the cgroup
@@ -319,7 +409,8 @@ putting processes in a cgroup that has controllers enabled in its own
 `crt setup` (root-only) is what creates `/sys/fs/cgroup/user-$UID/` and
 enables `+memory +cpu` in the parent's `subtree_control`; without that
 step `apply_cgroup` finds no delegated directory and warns rather than
-failing the run. On runit (Void) `crt setup` also installs
+failing the run. `crt setup` takes any number of users and does this for
+each. On runit (Void) `crt setup` also installs
 `/etc/sv/crt-cgroup/`, a service that redoes the delegation for every
 username listed in `/etc/crt-users` on boot, since the cgroup tree doesn't
 survive a reboot. Other init systems get printed manual steps instead of
@@ -345,6 +436,16 @@ mount namespace for `findmnt` to inspect. The pristine rule stays in force
 under test mode; a `crt_run` helper re-marks the mock rootfs before each
 run, standing in for `crt create`. `CRT_HOME` is created under `/var/tmp`
 because hardened runs refuse one under `/tmp`.
+
+Test mode also enables two variables for the root-only commands.
+`CRT_TEST_SYSROOT` is prefixed to `/data/crt`, `/usr/local/bin`,
+`/sys/fs/cgroup`, `/etc/sv`, `/etc/crt-users`, `/etc/runit`, `/run/runit` and
+`/var/service`, and `CRT_TEST_EUID` replaces `id -u` in the root check. The
+invoking user then counts as root for `check_root_only_path`, and mock
+`chown`, `getent` (reading `CRT_MOCK_PASSWD`) and `sv` stand in for the
+calls a non-root test cannot make. The doctor tests build a fake cgroup tree
+in the sysroot; ordinary files accept the `memory.max` and `cgroup.procs`
+writes, so the pass path is exercised too.
 
 `test/test-isolation.sh` is the real thing: it builds a throwaway rootfs
 that reuses the host `/usr` (bind-mounted read-only) and runs actual

@@ -2,7 +2,8 @@
 
 Minimal chroot manager. Creates and runs isolated rootfs environments using Linux namespace primitives — no Docker, no podman.
 
-See [docs/architecture.md](docs/architecture.md) for how it's built.
+See [docs/architecture.md](docs/architecture.md) for how it's built and
+[docs/backlog.md](docs/backlog.md) for outstanding work.
 
 ## How it works
 
@@ -90,8 +91,8 @@ Any isolation option (`--net none`, `--no-home`, `--tmp private`, a `:ro` bind,
   outside `$HOME`, `/tmp` and the host side of every `mount` line in every
   stored config. It is also refused if any of its own binds, `:ro` included,
   is, contains, or sits inside `CRT_HOME`, `.config` or `.state` (compared
-  after `realpath`). The default `/home/crt` is fine; keep `CRT_HOME` outside
-  `$HOME`.
+  after `realpath`). `/data/crt/home/<user>` and `/home/crt` are fine; keep
+  `CRT_HOME` outside `$HOME`. `crt doctor` checks this.
 
 Without any isolation option, `crt run` behaves as before: the command runs as
 root with capabilities, so `crt run ubuntu apt install -y perl` still works
@@ -113,10 +114,60 @@ stderr. This lets a parent hand the command an IPC channel, e.g. Node's
 
 ## Installation
 
+On a multi-user host, install into the `/data` layout once, then set up each
+user, service accounts included:
+
 ```sh
-cp crt /usr/local/bin/crt
-chmod +x /usr/local/bin/crt
+sudo ./crt install              # /data/crt/bin/crt, linked from /usr/local/bin/crt
+sudo crt setup john s-ci        # cgroup delegation + /data/crt/home/<user>
+crt doctor                      # as each user: is hardened mode ready?
 ```
+
+The layout:
+
+```
+/data/crt/              root, 755
+  bin/crt               the installed script, root, 755 (users cannot change it)
+  home/<user>/          that user's CRT_HOME, owned by the user, 700
+    <rootfs>/ .config/ .state/ .cache/ bin/
+```
+
+`crt install [--prefix DIR]` copies the running script to `DIR/bin/crt`
+(default `/data/crt`) as root with mode 755, makes `DIR`, `DIR/bin` and
+`DIR/home` root-owned 755, and points `/usr/local/bin/crt` at the copy,
+replacing an older copied `crt` there. It refuses unless run as root, and
+refuses a `DIR` whose parent directories are not owned by root or are writable
+by group or other. Running it again reinstalls only if the script changed.
+
+`crt setup [--prefix DIR] [user...]` delegates a cgroup to each user (see
+[Setup](#setup)) and, when `DIR` exists, creates `DIR/home/<user>` owned by
+that user with mode 700. With no user it sets up the `sudo` caller. The user's
+home directory comes from the passwd database, so a service account such as
+`s-ci` with home `/data/ci` works like anyone else. Setup warns when a user's
+`CRT_HOME` would sit inside their own home, since hardened runs refuse that.
+
+A non-default `--prefix` is not searched when resolving `CRT_HOME`; those
+users set `CRT_HOME=DIR/home/<user>` themselves.
+
+A single-user machine can skip the layout: `cp crt /usr/local/bin/crt` still
+works, with `CRT_HOME` at `/home/crt`.
+
+### crt doctor
+
+`crt doctor` checks the current user and exits 1 if anything blocks hardened
+runs:
+
+- the resolved `CRT_HOME` and where it came from;
+- `CRT_HOME` is owned by you and not writable by group or other (or, if it does
+  not exist yet, that its parent is writable);
+- `CRT_HOME` is outside `$HOME`, `/tmp` and every config `mount` source;
+- unprivileged user namespaces work (`unshare --user --map-root-user`).
+
+It also probes memory limits: a delegated `/sys/fs/cgroup/user-<uid>` with the
+memory controller, where you can create a child cgroup, set `memory.max` and
+move a process in. A failure there is a warning, since hardened mode does not
+need limits; `crt doctor --limits` makes it an error, for callers such as an
+eval harness that must not run without them.
 
 ## Usage
 
@@ -128,7 +179,9 @@ crt run [options] <name> <cmd>   Run command (flags override config; see below)
 crt list                         List rootfs environments
 crt rm     <name>                Remove rootfs
 crt export <name> <binary>       Create host wrapper script for a binary
-crt setup                        Enable memory/cpu limits (run once with sudo)
+crt install [--prefix DIR]       Install to DIR/bin/crt (root; default /data/crt)
+crt setup [--prefix DIR] [user…] Delegate cgroups, make DIR/home/<user> (root)
+crt doctor [--limits]            Check readiness for hardened runs
 ```
 
 ### `crt run` flags
@@ -155,12 +208,17 @@ Short flags (`-v -e -m -c`) accept an attached (`-v/x:/y`) or separate (`-v /x:/
 Resource limits (`memory`/`cpus`) require a one-time root step to delegate a cgroup to your user. After that they work automatically on every `crt run`.
 
 ```sh
-sudo crt setup
+sudo crt setup                # the sudo caller
+sudo crt setup john s-ci      # named users
 ```
 
-This:
-1. Creates `/sys/fs/cgroup/user-$UID/` and delegates memory+cpu control to your user
-2. On runit systems: installs `/etc/sv/crt-cgroup/` (backed by `/etc/crt-users`) so delegation persists across reboots
+For each user this:
+1. Creates `/sys/fs/cgroup/user-$UID/` and delegates memory+cpu control to that user
+2. Creates `/data/crt/home/<user>` (owner the user, mode 700) when `/data/crt` exists
+3. On runit systems: adds the user to `/etc/crt-users` and installs `/etc/sv/crt-cgroup/`, which redoes the delegation on every boot
+
+Every user is looked up before anything changes, so an unknown name leaves the
+host untouched. `crt doctor --limits`, run as the user, checks the result.
 
 If `crt setup` hasn't been run, `crt run -m 512M ...` warns and continues without limits.
 
@@ -273,9 +331,18 @@ Add `CRT_BIN` to your `PATH` and the binary behaves as if installed on the host.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CRT_HOME` | `/home/crt` | Where rootfs directories are stored |
-| `CRT_BIN` | `/home/crt/bin` | Where exported wrapper scripts are placed |
+| `CRT_HOME` | see below | Where rootfs directories are stored |
+| `CRT_BIN` | `$CRT_HOME/bin` under `/data/crt`, else `/home/crt/bin` | Where exported wrapper scripts are placed |
 | `VOID_REPO` | `https://repo-default.voidlinux.org/current` | xbps repository for Void bootstrap |
+
+`CRT_HOME` is resolved in this order:
+
+1. `$CRT_HOME`, if set and non-empty;
+2. `/data/crt/home/<user>`, if that directory exists (`<user>` is `id -un`);
+3. `/home/crt`.
+
+Existing setups keep working: a user with no `/data/crt/home/<user>` gets
+`/home/crt` as before. `crt doctor` prints the result.
 
 ## Runtime dependencies
 
@@ -285,7 +352,8 @@ Add `CRT_BIN` to your `PATH` and the binary behaves as if installed on the host.
 | `crt create <name> <image>` (OCI) | `curl`, `jq`, `tar` |
 | `crt run` / `crt enter` | `unshare`, `pivot_root`, `chroot` (util-linux) |
 | `crt run` (hardened) | also `setpriv`, `findmnt` (util-linux) and `realpath` (coreutils), inside the rootfs |
-| `crt setup` | root or `sudo` |
+| `crt install` / `crt setup` | root or `sudo`; `getent` for setup |
+| `crt doctor` | `unshare`; cgroup v2 for the limits probe |
 
 `unshare`, `pivot_root`, `chroot`, `setpriv`, and `findmnt` are in `util-linux`, present on any Linux system. In hardened mode `setpriv`, `findmnt`, and `realpath` must exist **inside the rootfs** (they run after `pivot_root`); a Void `base-minimal` or the `-v /usr:/usr:ro` used for the eval sandbox provides them. `curl` and `jq` are only needed for OCI pulls. Read-only bind verification and `--tmp private` use kernel features present on any modern (5.x) kernel.
 
@@ -293,7 +361,8 @@ User namespace support must be enabled on the host kernel (`/proc/sys/kernel/unp
 
 ## Storage layout
 
-Each environment is a plain directory under `CRT_HOME`:
+Each environment is a plain directory under `CRT_HOME` (`/data/crt/home/<user>`
+under the install layout, `/home/crt` otherwise):
 
 ```
 /home/crt/
@@ -314,8 +383,8 @@ Each environment is a plain directory under `CRT_HOME`:
     layers/      ← OCI layer blobs, keyed by digest
 ```
 
-`CRT_HOME` must live outside `$HOME` and `/tmp` (as the default `/home/crt`
-does) for hardened runs; see [Hardened mode](#hardened-mode).
+`CRT_HOME` must live outside `$HOME` and `/tmp` (as `/data/crt/home/<user>`
+and `/home/crt` do) for hardened runs; see [Hardened mode](#hardened-mode).
 
 Rootfs directories are self-contained; when moving or archiving one, take its
 `.config/<name>` entry with it. A moved or copied rootfs is not pristine (its
@@ -335,22 +404,28 @@ bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
 
 | Mock | Replaces | What it does |
 |---|---|---|
-| `unshare` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), strips namespace flags, runs the inner script on the host |
+| `unshare` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), strips namespace flags, runs the inner script on the host; fails when `CRT_MOCK_UNSHARE_FAIL` is set |
 | `pivot_root` | util-linux | Always fails, so in test mode `cmd_run` falls back to `chroot` (no real mount namespace under test) |
 | `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
 | `mount` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), then no-op |
 | `curl` | curl | Returns canned token/manifest JSON and the fixture layer `test/fixtures/layer.tar.gz` (whose sha256 is the manifest digest); can log blob fetches, serve a tampered blob, or serve an image built from crafted layers (`CRT_MOCK_LAYERS`, made with `test/mklayer.py`) |
 | `xbps-install` | xbps | Logs its args and stdin target (when `CRT_MOCK_LOG` is set), then creates a minimal `bin/sh` skeleton in the rootfs |
+| `chown` | coreutils | Logs its args (when `CRT_MOCK_LOG` is set), then no-op (the tests are not root) |
+| `getent` | libc | `getent passwd NAME` reads `CRT_MOCK_PASSWD` when set; otherwise the real `getent` |
+| `sv` | runit | Logs its args (when `CRT_MOCK_LOG` is set), never touches the host's runit |
 
 `test/test-crt.sh` sets `CRT_TEST_MODE` to its `test/mocks` directory. crt
 enables test mode only when `CRT_TEST_MODE` resolves to this repository's own
 `test/mocks` (found from the script's real path, carrying `.crt-mocks`): it
 takes `unshare` from the mocks, lets `cmd_run` fall back to `chroot`, and skips
 read-only verification when the mock `pivot_root` fails. Any other value does
-nothing. The suite keeps `CRT_HOME` under `/var/tmp`, and a `crt_run` helper
+nothing. Test mode also honors `CRT_TEST_SYSROOT`, a directory prefixed to
+`/data/crt`, `/usr/local/bin`, `/sys/fs/cgroup`, `/etc` and `/var/service`,
+and `CRT_TEST_EUID`, which stands in for the effective uid, so `install`,
+`setup` and `doctor` run against a fake host. The suite keeps `CRT_HOME` under `/var/tmp`, and a `crt_run` helper
 re-marks the mock rootfs pristine before each run (standing in for `crt
 create`). This lets the full `cmd_create` and `cmd_run` code paths run without
-root, namespaces, network, or xbps. 160 tests cover `parse_memory`,
+root, namespaces, network, or xbps. 197 tests cover `parse_memory`,
 `read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
 `write_config`, `parse_image_ref`, all three `create` dispatch paths (with the
@@ -367,7 +442,11 @@ immunity to caller-exported shell functions, name validation and alias
 refusal, the pristine marker (written by create, required by hardened runs,
 removed by writable runs, identity-keyed), `CRT_HOME` placement, the
 out-of-rootfs config and safe legacy migration, a symlinked `CRT_HOME`,
-`list`, `rm`, `export`, and `setup`.
+`list`, `rm`, `export`, the `CRT_HOME` resolution order, `install` (root
+check, owner and mode, the link, idempotence, unsafe prefixes), `setup`
+(per-user `CRT_HOME` dirs for several users, a service account, `SUDO_USER`,
+the home-overlap warning, runit registration, refusals), and `doctor` (each
+check and its exit code).
 
 `test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
 (bind-mounted read-only) and proves, in real namespaces, mostly from one run
@@ -391,7 +470,7 @@ under `/var/tmp`. 39 checks.
 ## Limitations
 
 - No private registry authentication
-- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup))
+- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup)). Moving a process into `user-<uid>` also needs write access to the common ancestor cgroup's `cgroup.procs`, so limits apply only when `crt` starts from a process already inside `user-<uid>`; `crt doctor --limits` tests this
 - `--net none` isolates the network but provides no NAT/bridge, so the container has loopback only (no outbound access)
 - **Default mode is not a sandbox.** A default run has your authority over the
   host and can modify any rootfs, config or marker under `CRT_HOME`. Never run

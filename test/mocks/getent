@@ -1,0 +1,11 @@
+#!/bin/sh
+# Mock getent: `getent passwd NAME` reads $CRT_MOCK_PASSWD when set; anything
+# else goes to the real getent.
+if [ -n "$CRT_MOCK_PASSWD" ] && [ "$1" = passwd ]; then
+    awk -F: -v u="$2" '$1 == u { print; f = 1 } END { exit !f }' "$CRT_MOCK_PASSWD"
+    exit
+fi
+for g in /usr/bin/getent /bin/getent; do
+    [ -x "$g" ] && exec "$g" "$@"
+done
+exit 1

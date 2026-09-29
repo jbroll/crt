@@ -1,0 +1,5 @@
+#!/bin/sh
+# Mock chown: log the call (when CRT_MOCK_LOG is set) and change nothing, since
+# the tests are not root.
+[ -n "$CRT_MOCK_LOG" ] && echo "chown $*" >> "$CRT_MOCK_LOG"
+exit 0

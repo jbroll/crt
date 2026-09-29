@@ -1,0 +1,4 @@
+#!/bin/sh
+# Mock sv: log the call (when CRT_MOCK_LOG is set), never touch the host's runit.
+[ -n "$CRT_MOCK_LOG" ] && echo "sv $*" >> "$CRT_MOCK_LOG"
+exit 0

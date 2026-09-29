@@ -8,7 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-The script follows a simple command-dispatch pattern: each subcommand (`create`, `enter`, `run`, `list`, `rm`, `export`) maps to a `cmd_*` function. The main dispatch is a `case` statement at the bottom of the file.
+The script follows a simple command-dispatch pattern: each subcommand (`create`, `enter`, `run`, `list`, `rm`, `export`, `install`, `setup`, `doctor`) maps to a `cmd_*` function. The main dispatch is a `case` statement at the bottom of the file; just before it, test mode is detected (`crt_test_mocks`) and `resolve_crt_home` sets `CRT_HOME`, `CRT_BIN`, `CRT_CONF_DIR` and `CRT_STATE_DIR`.
+
+**Install layout** (`cmd_install`, `cmd_setup`, `cmd_doctor`): `/data/crt` (root, 755) holds `bin/crt` (root, 755; `/usr/local/bin/crt` links to it) and `home/<user>` (each user's `CRT_HOME`, owned by the user, 700). `crt install [--prefix DIR]` copies the running script there atomically and is idempotent; `crt setup [--prefix DIR] [user...]` delegates cgroups and creates `home/<user>` for each user (arguments first, else `SUDO_USER`), looking every user up with `getent passwd` before changing anything, and warns when a user's `CRT_HOME` would be inside their passwd home. Both refuse unless root, reset `PATH` to the trusted path, and refuse a prefix whose ancestors are not root-only (`check_root_only_path`). `crt doctor [--limits]` reports the resolved `CRT_HOME`, its ownership and placement, whether user namespaces work, and probes the memory cgroup; it exits 1 on anything that blocks hardened runs (cgroup problems only with `--limits`).
 
 ### Key design decisions
 
@@ -29,7 +31,7 @@ Isolation options are both `crt run` flags and config directives, flags overridi
 - Second arg is an existing file → read as a config file
 - Second arg is a string → treat as an OCI image reference
 
-After creation, a config file is always written to `$CRT_HOME/<name>/config`.
+After creation, a config file is always written to `$CRT_HOME/.config/<name>` (outside the rootfs).
 
 **OCI image pull** (`_create_oci`, `oci_token`, `oci_manifest`, `oci_unpack`) is pure shell using `curl` + `jq` + `tar`. Supports Docker Hub, ghcr.io, quay.io, and any OCI Distribution Spec registry. Multi-arch image indexes are handled by selecting the layer matching `uname -m`. Layers are cached at `$CRT_HOME/.cache/layers/` keyed by digest.
 
@@ -39,8 +41,8 @@ After creation, a config file is always written to `$CRT_HOME/<name>/config`.
 
 ## Environment Variables
 
-- `CRT_HOME` — where rootfs directories live (default: `/home/crt`)
-- `CRT_BIN` — where exported wrapper scripts are placed (default: `/home/crt/bin`)
+- `CRT_HOME` — where rootfs directories live: `$CRT_HOME` if set, else `/data/crt/home/$(id -un)` if it exists, else `/home/crt`
+- `CRT_BIN` — where exported wrapper scripts are placed (default: `$CRT_HOME/bin` under the `/data/crt` layout, else `/home/crt/bin`)
 - `VOID_REPO` — xbps repository URL for Void bootstrap
 
 ## Running / Testing
@@ -58,6 +60,6 @@ shellcheck crt
 bash test/test-crt.sh
 ```
 
-`test/test-crt.sh` (96 tests) uses PATH-based mocks in `test/mocks/` that shadow `unshare`, `pivot_root`, `chroot`, `mount`, `curl`, and `xbps-install`, letting the full create and run code paths execute without root, namespaces, network, or xbps. It exports `CRT_TEST_MODE=1`, a test-only switch that lets `cmd_run` fall back to `chroot` and skip read-only verification when the mock `pivot_root` fails; real runs never set it. `unshare` and `mount` log their args to `$CRT_MOCK_LOG` when set, so tests can assert the generated namespace/mount calls.
+`test/test-crt.sh` (197 tests) uses PATH-based mocks in `test/mocks/` that shadow `unshare`, `pivot_root`, `chroot`, `mount`, `curl`, `xbps-install`, `chown`, `getent`, and `sv`, letting the full create, run, install, setup and doctor code paths execute without root, namespaces, network, or xbps. It sets `CRT_TEST_MODE` to its own `test/mocks` directory; crt enables test mode only for that exact directory (carrying `.crt-mocks`), and then lets `cmd_run` fall back to `chroot` and skip read-only verification, and honors `CRT_TEST_SYSROOT` (a fake `/` for `/data/crt`, `/usr/local/bin`, `/sys/fs/cgroup`, `/etc`, `/var/service`) and `CRT_TEST_EUID` (fake root check). Real runs never set it. `unshare`, `mount`, `chown` and `sv` log their args to `$CRT_MOCK_LOG` when set, so tests can assert the generated calls; `getent passwd` reads `$CRT_MOCK_PASSWD`.
 
-`test/test-isolation.sh` (23 checks) is a separate real-namespace test: it builds a throwaway rootfs reusing the host `/usr` (bind-mounted read-only) and, mostly from one run with the full flag set, verifies old-root detachment, the capless lockdown (remount/umount/new-mount all blocked), home/tmp hiding, the minimal `/dev`, ro-bind enforcement, clean env, fd keep/close, `NODE_CHANNEL_FD` auto-keep, network isolation, and that a default run is unchanged. It self-skips when unprivileged user namespaces are unavailable and has no `~/bin` dependency (its own tiny harness, not `test/Test`).
+`test/test-isolation.sh` (39 checks) is a separate real-namespace test: it builds a throwaway rootfs reusing the host `/usr` (bind-mounted read-only) and, mostly from one run with the full flag set, verifies old-root detachment, the capless lockdown (remount/umount/new-mount all blocked), home/tmp hiding, the minimal `/dev`, ro-bind enforcement, clean env, fd keep/close, `NODE_CHANNEL_FD` auto-keep, network isolation, and that a default run is unchanged. It self-skips when unprivileged user namespaces are unavailable and has no `~/bin` dependency (its own tiny harness, not `test/Test`).

@@ -982,4 +982,238 @@ result=$(CRT_HOME="$link_home" crt_run symenv sh -c 'echo linked-ok' 2>/dev/null
 CompareArgs "$result" "linked-ok"
 rm -rf "$real_home"; rm -f "$link_home"
 
+# ── install layout: CRT_HOME resolution ───────────────────────────────────────
+# CRT_TEST_SYSROOT prefixes /data/crt, /usr/local/bin, /sys/fs/cgroup, /etc and
+# /var/service; CRT_TEST_EUID=0 stands in for root. Both work only in test mode.
+echo "# CRT_HOME resolution"
+
+SYSR=$(mktemp -d -p /var/tmp crt-sysroot.XXXXXX)
+ME=$(id -un)
+LAYOUT="$SYSR/data/crt"
+
+# resolved_home [env...]: the CRT_HOME line crt doctor reports.
+resolved_home() {
+    env -u CRT_HOME -u CRT_BIN CRT_TEST_SYSROOT="$SYSR" "$@" "$CRT" doctor 2>/dev/null \
+        | awk '$1 == "info" && $2 == "CRT_HOME" { print $3; exit }'
+}
+
+Test "resolve: \$CRT_HOME wins over the /data layout"
+mkdir -p "$LAYOUT/home/$ME"
+CompareArgs "$(resolved_home CRT_HOME="$CRT_HOME")" "$CRT_HOME"
+
+Test "resolve: unset CRT_HOME uses /data/crt/home/<user> when it exists"
+CompareArgs "$(resolved_home)" "$LAYOUT/home/$ME"
+
+Test "resolve: CRT_BIN defaults to CRT_HOME/bin under the layout"
+mkdir -p "$LAYOUT/home/$ME/lenv/bin" "$LAYOUT/home/$ME/lenv/usr/bin"
+printf '#!/bin/sh\n' > "$LAYOUT/home/$ME/lenv/usr/bin/ltool"
+env -u CRT_HOME -u CRT_BIN CRT_TEST_SYSROOT="$SYSR" "$CRT" export lenv ltool >/dev/null 2>&1
+if [ -x "$LAYOUT/home/$ME/bin/ltool" ]; then Pass; else Fail; fi
+
+Test "resolve: without the layout dir CRT_HOME falls back to /home/crt"
+rm -rf "$LAYOUT/home/$ME"
+CompareArgs "$(resolved_home)" "/home/crt"
+
+Test "resolve: CRT_TEST_SYSROOT is ignored outside test mode"
+mkdir -p "$LAYOUT/home/$ME"
+if [ "$(resolved_home CRT_TEST_MODE=)" != "$LAYOUT/home/$ME" ]; then Pass; else Fail; fi
+rm -rf "$LAYOUT"
+
+# ── crt install ───────────────────────────────────────────────────────────────
+echo "# crt install"
+
+ILOG="$SYSR/mock.log"
+as_root() { CRT_TEST_EUID=0 CRT_TEST_SYSROOT="$SYSR" CRT_MOCK_LOG="$ILOG" "$CRT" "$@"; }
+
+Test "install: refuses when not root"
+out=$(CRT_TEST_SYSROOT="$SYSR" "$CRT" install 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "must run as root" && [ ! -e "$LAYOUT" ]; then Pass; else Fail; fi
+
+Test "install: copies crt to <prefix>/bin/crt, 755, chowned to root"
+: > "$ILOG"
+as_root install >/dev/null 2>&1
+if cmp -s "$CRT" "$LAYOUT/bin/crt" && [ "$(stat -c %a "$LAYOUT/bin/crt")" = 755 ] \
+   && grep -qx "chown -- root:root $LAYOUT/bin/crt" "$ILOG"; then Pass; else Fail; fi
+
+Test "install: <prefix>, bin and home are root-owned 755"
+if [ "$(stat -c %a "$LAYOUT" "$LAYOUT/bin" "$LAYOUT/home" | sort -u)" = 755 ] \
+   && grep -qx "chown -- root:root $LAYOUT" "$ILOG" \
+   && grep -qx "chown -- root:root $LAYOUT/home" "$ILOG"; then Pass; else Fail; fi
+
+Test "install: links /usr/local/bin/crt to the installed script"
+CompareArgs "$(readlink "$SYSR/usr/local/bin/crt")" "$LAYOUT/bin/crt"
+
+Test "install: a second run is idempotent"
+out=$(as_root install 2>&1); rc=$?
+if [ "$rc" = 0 ] && echo "$out" | grep -q "is up to date" && echo "$out" | grep -q "already points to" \
+   && [ -z "$(find "$LAYOUT/bin" -name '.crt.new.*')" ]; then Pass; else Fail; fi
+
+Test "install: replaces a changed installed copy"
+printf '#!/bin/sh\necho old\n' > "$LAYOUT/bin/crt"
+as_root install >/dev/null 2>&1
+if cmp -s "$CRT" "$LAYOUT/bin/crt"; then Pass; else Fail; fi
+
+Test "install: replaces an old copy at /usr/local/bin/crt with the link"
+rm -f "$SYSR/usr/local/bin/crt"; cp "$CRT" "$SYSR/usr/local/bin/crt"
+as_root install >/dev/null 2>&1
+if [ -L "$SYSR/usr/local/bin/crt" ] && [ "$(readlink "$SYSR/usr/local/bin/crt")" = "$LAYOUT/bin/crt" ]; then Pass; else Fail; fi
+
+Test "install: --prefix installs elsewhere"
+as_root install --prefix "$SYSR/opt/crt" >/dev/null 2>&1
+if cmp -s "$CRT" "$SYSR/opt/crt/bin/crt" && [ "$(readlink "$SYSR/usr/local/bin/crt")" = "$SYSR/opt/crt/bin/crt" ]; then Pass; else Fail; fi
+as_root install >/dev/null 2>&1
+
+Test "install: refuses a prefix below a group-writable directory"
+mkdir -p "$SYSR/gw"; chmod 775 "$SYSR/gw"
+out=$(as_root install --prefix "$SYSR/gw/crt" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "writable by group or other" && [ ! -e "$SYSR/gw/crt" ]; then Pass; else Fail; fi
+
+Test "install: refuses a relative prefix"
+out=$(as_root install --prefix rel/crt 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "absolute path"; then Pass; else Fail; fi
+
+# ── crt setup ─────────────────────────────────────────────────────────────────
+echo "# crt setup"
+
+PW="$SYSR/passwd"
+cat > "$PW" << EOF
+alice:x:1000:1000::/home/alice:/bin/bash
+s-ci:x:990:991::/data/ci:/bin/sh
+bob:x:1001:1001::/home/bob:/bin/sh
+odd:x:992:992::$LAYOUT/home:/bin/sh
+eve:x:993:993::/home/eve:/bin/sh
+EOF
+mkdir -p "$SYSR/sys/fs/cgroup" "$SYSR/etc/runit" "$SYSR/var/service"
+: > "$SYSR/etc/runit/1"
+setup_root() { CRT_MOCK_PASSWD="$PW" as_root setup "$@"; }
+
+Test "setup: makes <prefix>/home/<user> 700 and chowns it to each user"
+: > "$ILOG"
+setup_root alice s-ci > "$SYSR/setup.out" 2>&1
+if [ "$(stat -c %a "$LAYOUT/home/alice")" = 700 ] && [ "$(stat -c %a "$LAYOUT/home/s-ci")" = 700 ] \
+   && grep -qx "chown -- 1000:1000 $LAYOUT/home/alice" "$ILOG" \
+   && grep -qx "chown -- 990:991 $LAYOUT/home/s-ci" "$ILOG"; then Pass; else Fail; fi
+
+Test "setup: delegates a cgroup to each user"
+if grep -qx "chown -R -- 1000:1000 $SYSR/sys/fs/cgroup/user-1000" "$ILOG" \
+   && grep -qx "chown -R -- 990:991 $SYSR/sys/fs/cgroup/user-990" "$ILOG"; then Pass; else Fail; fi
+
+Test "setup: a service account with home /data/ci gets no overlap warning"
+if grep -q "overlaps" "$SYSR/setup.out"; then Fail; else Pass; fi
+
+Test "setup: registers each user once and installs the runit service"
+setup_root alice s-ci >/dev/null 2>&1
+if [ "$(cat "$SYSR/etc/crt-users")" = "$(printf 'alice\ns-ci')" ] \
+   && [ -L "$SYSR/var/service/crt-cgroup" ] && [ -x "$SYSR/etc/sv/crt-cgroup/run" ] \
+   && grep -qx "sv restart crt-cgroup" "$ILOG"; then Pass; else Fail; fi
+
+Test "setup: with no user argument sets up SUDO_USER"
+: > "$ILOG"
+SUDO_USER=bob setup_root >/dev/null 2>&1
+if [ -d "$LAYOUT/home/bob" ] && grep -q "user-1001" "$ILOG"; then Pass; else Fail; fi
+
+Test "setup: a user argument wins over SUDO_USER"
+: > "$ILOG"
+SUDO_USER=bob setup_root s-ci >/dev/null 2>&1
+if grep -q "user-990" "$ILOG" && ! grep -q "user-1001" "$ILOG"; then Pass; else Fail; fi
+
+Test "setup: warns when CRT_HOME would be inside the user's home"
+out=$(setup_root odd 2>&1)
+if echo "$out" | grep -q "overlaps their home directory"; then Pass; else Fail; fi
+
+Test "setup: an unknown user is refused before any change"
+rm -rf "$LAYOUT/home/bob"
+out=$(setup_root bob nosuch 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "unknown user 'nosuch'" && [ ! -e "$LAYOUT/home/bob" ]; then Pass; else Fail; fi
+
+Test "setup: an invalid user name is refused"
+out=$(setup_root ../alice 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "invalid user name"; then Pass; else Fail; fi
+
+Test "setup: a symlink at <prefix>/home/<user> is refused"
+ln -s /var/tmp "$LAYOUT/home/eve"
+out=$(setup_root eve 2>&1); rc=$?
+rm -f "$LAYOUT/home/eve"
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "is not a directory"; then Pass; else Fail; fi
+
+Test "setup: refuses a prefix that is not root-only"
+chmod 775 "$LAYOUT"
+out=$(setup_root bob 2>&1); rc=$?
+chmod 755 "$LAYOUT"
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "crt install" && [ ! -e "$LAYOUT/home/bob" ]; then Pass; else Fail; fi
+
+Test "setup: without the prefix dir CRT_HOME stays /home/crt"
+out=$(setup_root --prefix "$SYSR/none" bob 2>&1); rc=$?
+if [ "$rc" = 0 ] && echo "$out" | grep -q "CRT_HOME stays /home/crt" && [ ! -e "$SYSR/none" ]; then Pass; else Fail; fi
+
+# ── crt doctor ────────────────────────────────────────────────────────────────
+echo "# crt doctor"
+
+DSYS=$(mktemp -d -p /var/tmp crt-dsys.XXXXXX)
+DH=$(mktemp -d -p /var/tmp crt-dh.XXXXXX)
+# doctor_out [env...] -- [args...]: output of crt doctor with CRT_HOME=$DH; rc in $drc.
+doctor_out() {
+    local -a envs=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+    [ $# -gt 0 ] && shift
+    dout=$(env CRT_HOME="$DH" CRT_TEST_SYSROOT="$DSYS" "${envs[@]}" "$CRT" doctor "$@" 2>&1)
+    drc=$?
+}
+
+Test "doctor: passes with a private CRT_HOME outside HOME and /tmp"
+doctor_out
+if [ "$drc" = 0 ] && echo "$dout" | grep -q "^ok    CRT_HOME is outside" \
+   && echo "$dout" | grep -q "^ok    unprivileged user namespaces work"; then Pass; else Fail; fi
+
+Test "doctor: a missing cgroup is a warning, not a failure"
+if [ "$drc" = 0 ] && echo "$dout" | grep -q "^warn  cgroup v2 is not mounted"; then Pass; else Fail; fi
+
+Test "doctor: --limits makes a missing cgroup fatal"
+doctor_out -- --limits
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  cgroup v2 is not mounted"; then Pass; else Fail; fi
+
+Test "doctor: CRT_HOME under /tmp fails"
+th=$(mktemp -d -p /tmp crt-dh.XXXXXX)
+doctor_out CRT_HOME="$th"
+rm -rf "$th"
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  CRT_HOME overlaps /tmp"; then Pass; else Fail; fi
+
+Test "doctor: CRT_HOME inside \$HOME fails"
+doctor_out HOME="$(dirname "$DH")"
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  CRT_HOME overlaps \$HOME"; then Pass; else Fail; fi
+
+Test "doctor: a config mount source over CRT_HOME fails"
+mkdir -p "$DH/.config"; printf 'mount %s:/x\n' "$DH" > "$DH/.config/leak"
+doctor_out
+rm -f "$DH/.config/leak"
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  CRT_HOME overlaps the mount source"; then Pass; else Fail; fi
+
+Test "doctor: a group-writable CRT_HOME fails"
+chmod 770 "$DH"
+doctor_out
+chmod 700 "$DH"
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  CRT_HOME is writable by group or other"; then Pass; else Fail; fi
+
+Test "doctor: failing user namespaces are fatal"
+doctor_out CRT_MOCK_UNSHARE_FAIL=1
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  unprivileged user namespaces do not work"; then Pass; else Fail; fi
+
+UCG="$DSYS/sys/fs/cgroup/user-$(id -u)"
+mkdir -p "$UCG"
+printf 'cpu memory\n' > "$DSYS/sys/fs/cgroup/cgroup.controllers"
+: > "$UCG/cgroup.procs"
+
+Test "doctor: a delegated cgroup without the memory controller is reported"
+printf 'cpu\n' > "$UCG/cgroup.controllers"
+doctor_out -- --limits
+if [ "$drc" = 1 ] && echo "$dout" | grep -q "^FAIL  the memory controller is not enabled"; then Pass; else Fail; fi
+
+Test "doctor: a delegated cgroup with memory passes the probe and cleans up"
+printf 'cpu memory\n' > "$UCG/cgroup.controllers"
+doctor_out -- --limits
+if [ "$drc" = 0 ] && echo "$dout" | grep -q "^ok    memory limits work" \
+   && [ -z "$(find "$UCG" -name 'crt-doctor-*')" ]; then Pass; else Fail; fi
+
+rm -rf "$SYSR" "$DSYS" "$DH"
+
 TestDone

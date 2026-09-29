@@ -9,6 +9,9 @@
 #   crt list                        # List chroots
 #   crt rm <name>                   # Remove chroot
 #   crt export <name> <binary>      # Create host wrapper for binary
+#   crt install [--prefix DIR]      # Install to DIR/bin/crt (root), default /data/crt
+#   crt setup [--prefix DIR] [user...]  # Delegate cgroup, make DIR/home/<user> (root)
+#   crt doctor [--limits]           # Check readiness for hardened runs
 
 set -e
 
@@ -26,13 +29,35 @@ for _v in $(compgen -e 2>/dev/null); do
 done
 unset _v
 
-CRT_HOME="${CRT_HOME:-/home/crt}"
-CRT_BIN="${CRT_BIN:-/home/crt/bin}"
+readonly CRT_TRUSTED_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+readonly CRT_DEFAULT_HOME=/home/crt
 
-# Per-rootfs stored config and state live OUTSIDE every rootfs, so a container
-# can neither read nor rewrite the config that governs its own (or a later) run.
-CRT_CONF_DIR="$CRT_HOME/.config"
-CRT_STATE_DIR="$CRT_HOME/.state"
+# resolve_crt_home — CRT_HOME is $CRT_HOME if set, else <prefix>/home/<user>
+# if that directory exists, else /home/crt. CRT_BIN defaults to $CRT_HOME/bin
+# under the /data layout and to /home/crt/bin otherwise (as before the layout).
+resolve_crt_home() {
+    local user layout=0
+    if [ -n "${CRT_HOME:-}" ]; then
+        CRT_HOME_FROM="\$CRT_HOME"
+    else
+        user=$(id -un 2>/dev/null) || user=""
+        if [ -n "$user" ] && [ -d "$CRT_DATA_PREFIX/home/$user" ]; then
+            CRT_HOME="$CRT_DATA_PREFIX/home/$user"
+            CRT_HOME_FROM="$CRT_DATA_PREFIX/home/<user>"
+            layout=1
+        else
+            CRT_HOME=$CRT_DEFAULT_HOME
+            CRT_HOME_FROM="the default"
+        fi
+    fi
+    if [ -z "${CRT_BIN:-}" ]; then
+        if [ "$layout" = 1 ]; then CRT_BIN="$CRT_HOME/bin"; else CRT_BIN="$CRT_DEFAULT_HOME/bin"; fi
+    fi
+    # Per-rootfs stored config and state live OUTSIDE every rootfs, so a container
+    # can neither read nor rewrite the config that governs its own (or a later) run.
+    CRT_CONF_DIR="$CRT_HOME/.config"
+    CRT_STATE_DIR="$CRT_HOME/.state"
+}
 
 # Rootfs names are single path components: letters, digits, '.', '_', '-',
 # starting with a letter or digit. This rules out '/', '..', a trailing slash
@@ -96,28 +121,35 @@ _paths_overlap() {
 # Hardened guarantees rely on no container being able to reach CRT_HOME (rootfs
 # trees, .config, .state). A non-hardened run binds $HOME, /tmp and the host side
 # of any mount line in any stored config, so CRT_HOME must not overlap those.
-check_crt_home_placement() {  # canonical CRT_HOME
-    local home_real="$1" p cfg key val src c
-    local -a cand=()
+crt_home_exposures() {  # prints "canonical-path|label" per bindable path
+    local p cfg key val src
     if [ -n "${HOME:-}" ]; then
-        p=$(realpath -m -- "$HOME" 2>/dev/null) && cand+=("$p|\$HOME")
+        p=$(realpath -m -- "$HOME" 2>/dev/null) && printf '%s|%s\n' "$p" "\$HOME"
     fi
-    p=$(realpath -m -- /tmp 2>/dev/null) && cand+=("$p|/tmp")
+    p=$(realpath -m -- /tmp 2>/dev/null) && printf '%s|%s\n' "$p" /tmp
     for cfg in "$CRT_CONF_DIR"/*; do
         [ -f "$cfg" ] || continue
         while read -r key val; do
             [ "$key" = mount ] && [ -n "$val" ] || continue
             src=${val%%:*}
             p=$(realpath -m -- "$src" 2>/dev/null) \
-                && cand+=("$p|the mount source $src in the '${cfg##*/}' config")
+                && printf '%s|%s\n' "$p" "the mount source $src in the '${cfg##*/}' config"
         done < "$cfg"
     done
+    return 0
+}
+
+check_crt_home_placement() {  # canonical CRT_HOME
+    local home_real="$1" c
+    local -a cand=()
+    mapfile -t cand < <(crt_home_exposures)
     for c in "${cand[@]}"; do
         if _paths_overlap "$home_real" "${c%%|*}"; then
             echo "Error: CRT_HOME ($home_real) overlaps ${c#*|} (${c%%|*})," >&2
             echo "  which a non-hardened run can bind, so a container could change a" >&2
             echo "  rootfs, its config or its state. Move CRT_HOME outside \$HOME and /tmp" >&2
-            echo "  (the default /home/crt is fine) and keep mount sources out of it." >&2
+            echo "  (/data/crt/home/<user> or /home/crt is fine) and keep mount sources out" >&2
+            echo "  of it. 'crt doctor' checks the placement." >&2
             return 1
         fi
     done
@@ -158,6 +190,32 @@ crt_mocks_dir() {
     dir=$(realpath -e -- "$(dirname -- "$self")/test/mocks" 2>/dev/null) || return 1
     [ -f "$dir/.crt-mocks" ] || return 1
     printf '%s\n' "$dir"
+}
+
+# Test mode is on only when CRT_TEST_MODE names this repo's own test/mocks
+# directory (resolved from the script's real location; it must carry the
+# .crt-mocks marker). Any other value (a bare 1, a relative path, another
+# directory with a marker, or an installed crt with no test dir) does nothing.
+crt_test_mocks() {
+    local mocks tm
+    [ -n "${CRT_TEST_MODE:-}" ] || return 1
+    mocks=$(crt_mocks_dir) || return 1
+    tm=$(realpath -e -- "$CRT_TEST_MODE" 2>/dev/null) || return 1
+    [ "$tm" = "$mocks" ] || return 1
+    printf '%s\n' "$mocks"
+}
+
+# unshare comes from a fixed absolute list (never a PATH or function lookup),
+# or from this repo's mocks under test mode.
+find_unshare() {
+    local p
+    if [ -n "$CRT_TEST_MOCKS" ]; then
+        printf '%s\n' "$CRT_TEST_MOCKS/unshare"; return 0
+    fi
+    for p in /usr/bin/unshare /bin/unshare /usr/sbin/unshare /sbin/unshare; do
+        if [[ -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+    done
+    return 1
 }
 
 parse_image_ref() {
@@ -880,21 +938,14 @@ cmd_run() {
     # Trusted binary path. crt resolves the host-side helpers it runs (unshare,
     # and inside the namespace mount/pivot_root/setpriv/...) from this fixed path,
     # never the caller's PATH, so an -e/config PATH cannot substitute them.
-    local crt_trusted="/usr/bin:/bin:/usr/sbin:/sbin"
-    local crt_binpath="$crt_trusted"
+    local crt_binpath="$CRT_TRUSTED_PATH"
 
-    # Test mode is enabled only when CRT_TEST_MODE names this repo's own
-    # test/mocks directory (resolved from the script's real location; it must
-    # carry the .crt-mocks marker). Any other value — a bare 1, a relative path,
-    # another directory with a marker, or an installed crt with no test dir —
-    # does nothing. It routes binary resolution through the mocks, allows the
-    # chroot fallback, and skips the findmnt-based ro verification.
-    local crt_test=0 crt_mocks="" tm_real
-    if [ -n "${CRT_TEST_MODE:-}" ] && crt_mocks=$(crt_mocks_dir) \
-       && tm_real=$(realpath -e -- "$CRT_TEST_MODE" 2>/dev/null) \
-       && [ "$tm_real" = "$crt_mocks" ]; then
+    # Test mode (see crt_test_mocks) routes binary resolution through the
+    # mocks, allows the chroot fallback, and skips the findmnt ro verification.
+    local crt_test=0
+    if [ -n "$CRT_TEST_MOCKS" ]; then
         crt_test=1
-        crt_binpath="$crt_mocks:$crt_trusted"
+        crt_binpath="$CRT_TEST_MOCKS:$CRT_TRUSTED_PATH"
     fi
 
     # Hardened mode runs rootfs binaries (umount, setpriv) after pivot_root while
@@ -919,16 +970,8 @@ cmd_run() {
             || { echo "Error: cannot remove the pristine marker for '$name'; not starting." >&2; exit 1; }
     fi
 
-    # unshare is taken from a fixed absolute list (never a PATH or function
-    # lookup), or from this repo's mocks under test mode.
-    local UNSHARE="" p
-    if [ "$crt_test" = 1 ]; then
-        UNSHARE="$crt_mocks/unshare"
-    else
-        for p in /usr/bin/unshare /bin/unshare /usr/sbin/unshare /sbin/unshare; do
-            if [[ -x "$p" ]]; then UNSHARE=$p; break; fi
-        done
-    fi
+    local UNSHARE=""
+    UNSHARE=$(find_unshare) || UNSHARE=""
     [[ -n "$UNSHARE" && -x "$UNSHARE" ]] \
         || { echo "Error: unshare not found in /usr/bin, /bin, /usr/sbin or /sbin" >&2; exit 1; }
 
@@ -1276,71 +1319,251 @@ EOF
     echo "Exported: $wrapper -> $name:$bin_path"
 }
 
-cmd_setup() {
-    # Must run as root (directly or via sudo)
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "Error: 'crt setup' must run as root." >&2
-        echo "  Try: sudo crt setup" >&2
-        exit 1
-    fi
+# ── Install layout: install, setup, doctor ────────────────────────────────────
+# <prefix> (default /data/crt, root, 755) holds bin/crt (root, 755) and
+# home/<user>, each user's CRT_HOME (owned by the user, 700). Under test mode
+# CRT_TEST_SYSROOT prefixes the system paths and CRT_TEST_EUID fakes the uid.
 
-    # Determine the target user
-    local target_uid target_gid target_user
-    if [ -n "${SUDO_UID:-}" ]; then
-        # Invoked via sudo — set up for the invoking user
-        target_uid="$SUDO_UID"
-        target_gid="${SUDO_GID:-$SUDO_UID}"
-        target_user="${SUDO_USER:-uid-$SUDO_UID}"
-    elif [ -n "${1:-}" ]; then
-        # Username passed explicitly (e.g. root running: crt setup alice)
-        target_uid=$(id -u "$1" 2>/dev/null) || {
-            echo "Error: unknown user '$1'" >&2
-            exit 1
-        }
-        target_gid=$(id -g "$1" 2>/dev/null) || {
-            echo "Error: cannot get gid for '$1'" >&2
-            exit 1
-        }
-        target_user="$1"
+crt_euid() {
+    if [ -n "$CRT_TEST_MOCKS" ] && [ -n "${CRT_TEST_EUID:-}" ]; then
+        printf '%s\n' "$CRT_TEST_EUID"
     else
-        echo "Error: run as 'sudo crt setup' or 'crt setup <username>'" >&2
+        id -u
+    fi
+}
+
+require_root() {  # subcommand
+    if [ "$(crt_euid)" != 0 ]; then
+        echo "Error: 'crt $1' must run as root." >&2
+        echo "  Try: sudo crt $1" >&2
         exit 1
     fi
+}
 
-    # 1. Immediate cgroup delegation
-    printf '+memory +cpu\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || {
-        echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
-    }
-    local cg="/sys/fs/cgroup/user-${target_uid}"
-    mkdir -p "$cg"
-    chown -R "${target_uid}:${target_gid}" "$cg"
-    echo "crt: cgroup delegation active for $target_user (uid=$target_uid)"
+# Root-only commands resolve their helpers from the trusted PATH, as cmd_run does.
+use_trusted_path() {
+    PATH=$CRT_TRUSTED_PATH
+    if [ -n "$CRT_TEST_MOCKS" ]; then PATH="$CRT_TEST_MOCKS:$PATH"; fi
+    export PATH
+}
 
-    # 2. Install boot-time persistence
-    local init_system="unknown"
-    { [ -d /run/runit ] || [ -f /etc/runit/1 ]; } && init_system="runit"
+# Under test mode the invoking user stands in for root as an owner.
+_is_root_uid() {
+    [ "$1" = 0 ] || { [ -n "$CRT_TEST_MOCKS" ] && [ "$1" = "$(id -u)" ]; }
+}
 
-    case "$init_system" in
-        runit)
-            _setup_runit "$target_uid" "$target_gid" "$target_user"
-            ;;
-        *)
-            echo "Warning: unrecognised init system — limits active now but won't survive reboot" >&2
-            echo "  Add to your system startup (as root):" >&2
-            printf '    printf '"'"'+memory +cpu\\n'"'"' >> /sys/fs/cgroup/cgroup.subtree_control\n' >&2
-            echo "    mkdir -p /sys/fs/cgroup/user-${target_uid}" >&2
-            echo "    chown -R ${target_uid}:${target_gid} /sys/fs/cgroup/user-${target_uid}" >&2
-            ;;
+# check_root_only_path P — P and every existing directory above it is owned by
+# root and not writable by group or other (sticky directories excepted), so no
+# other user can rename or replace what crt installs below it.
+check_root_only_path() {
+    local d owner mode
+    d=$(realpath -m -- "$1") || return 1
+    while :; do
+        if [ -e "$d" ]; then
+            read -r owner mode < <(stat -c '%u %a' -- "$d") || return 1
+            if ! _is_root_uid "$owner"; then
+                echo "Error: $d is owned by uid $owner, not root." >&2; return 1
+            fi
+            if (( (8#$mode & 8#022) && !(8#$mode & 8#1000) )); then
+                echo "Error: $d is writable by group or other (mode $mode)." >&2; return 1
+            fi
+        fi
+        [ "$d" = / ] && return 0
+        d=$(dirname -- "$d")
+    done
+}
+
+make_root_dir() {  # dir: create it, or fix it, as root-owned 755
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+        echo "Error: $1 exists and is not a directory." >&2; return 1
+    fi
+    mkdir -p -- "$1" && chown -- root:root "$1" && chmod 755 -- "$1"
+}
+
+parse_prefix() {  # value — prints the canonical absolute prefix
+    case "$1" in
+        /?*) realpath -m -- "$1" ;;
+        *) echo "Error: the prefix must be an absolute path other than /" >&2; return 1 ;;
     esac
 }
 
-_setup_runit() {
-    local uid="$1"
-    local gid="$2"
-    local user="$3"
+_same_content() {
+    local a b
+    a=$(sha256sum -- "$1" 2>/dev/null) && b=$(sha256sum -- "$2" 2>/dev/null) \
+        && [ "${a%% *}" = "${b%% *}" ]
+}
 
-    local sv_dir="/etc/sv/crt-cgroup"
-    local service_dir="/var/service"
+cmd_install() {
+    local prefix="$CRT_DATA_PREFIX"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --prefix)   [ $# -ge 2 ] || { echo "Error: --prefix requires a directory" >&2; exit 1; }
+                        prefix="$2"; shift 2 ;;
+            --prefix=*) prefix="${1#--prefix=}"; shift ;;
+            *) echo "Usage: crt install [--prefix DIR]" >&2; exit 1 ;;
+        esac
+    done
+    prefix=$(parse_prefix "$prefix") || exit 1
+    require_root install
+    use_trusted_path
+
+    local self dest tmp link
+    self=$(realpath -e -- "${BASH_SOURCE[0]}") \
+        || { echo "Error: cannot resolve the running crt script" >&2; exit 1; }
+    check_root_only_path "$(dirname -- "$prefix")" || exit 1
+    make_root_dir "$prefix" && make_root_dir "$prefix/bin" && make_root_dir "$prefix/home" \
+        || exit 1
+
+    dest="$prefix/bin/crt"
+    if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+        echo "Error: $dest is a directory." >&2; exit 1
+    fi
+    if [ ! -L "$dest" ] && [ "$self" = "$(realpath -m -- "$dest")" ]; then
+        echo "crt: $dest is the running script"
+    elif [ ! -L "$dest" ] && [ -f "$dest" ] && _same_content "$self" "$dest"; then
+        echo "crt: $dest is up to date"
+    else
+        tmp="$prefix/bin/.crt.new.$$"
+        if ! { cp -- "$self" "$tmp" && chown -- root:root "$tmp" && chmod 755 -- "$tmp" \
+               && mv -fT -- "$tmp" "$dest"; }; then
+            rm -f -- "$tmp"
+            echo "Error: cannot install $dest" >&2; exit 1
+        fi
+        echo "crt: installed $dest"
+    fi
+    chown -- root:root "$dest" && chmod 755 -- "$dest" || exit 1
+
+    link="$CRT_SYSROOT/usr/local/bin/crt"
+    if [ -L "$link" ] && [ "$(readlink -- "$link")" = "$dest" ]; then
+        echo "crt: $link already points to $dest"
+    elif [ -d "$link" ] && [ ! -L "$link" ]; then
+        echo "Error: $link is a directory." >&2; exit 1
+    else
+        if [ -e "$link" ] && [ ! -L "$link" ]; then echo "crt: replacing the copy at $link"; fi
+        mkdir -p -- "$(dirname -- "$link")"
+        ln -sfT -- "$dest" "$link"
+        echo "crt: linked $link -> $dest"
+    fi
+}
+
+user_entry() {  # user — prints "uid:gid:home" from the passwd database
+    local line name uid gid home
+    line=$(getent passwd "$1") || return 1
+    IFS=: read -r name _ uid gid _ home _ <<< "$line"
+    [ "$name" = "$1" ] && [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$gid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s:%s:%s\n' "$uid" "$gid" "$home"
+}
+
+setup_user_home() {  # user uid gid dir
+    local d="$4"
+    if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+        echo "Error: $d exists and is not a directory." >&2; return 1
+    fi
+    if [ ! -d "$d" ]; then mkdir -m 700 -- "$d" || return 1; fi
+    chown -- "$2:$3" "$d" && chmod 700 -- "$d" || return 1
+    echo "crt: CRT_HOME for $1 is $d (owner $1, mode 700)"
+}
+
+warn_home_overlap() {  # user home crt_home
+    local h c
+    h=$(realpath -m -- "$2" 2>/dev/null) || return 0
+    c=$(realpath -m -- "$3" 2>/dev/null) || return 0
+    if _paths_overlap "$h" "$c"; then
+        echo "Warning: $1's CRT_HOME $c overlaps their home directory $h," >&2
+        echo "  so crt refuses hardened runs for $1. Give $1 a CRT_HOME outside $h." >&2
+    fi
+    return 0
+}
+
+cmd_setup() {
+    local prefix="$CRT_DATA_PREFIX"
+    local -a users=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --prefix)   [ $# -ge 2 ] || { echo "Error: --prefix requires a directory" >&2; exit 1; }
+                        prefix="$2"; shift 2 ;;
+            --prefix=*) prefix="${1#--prefix=}"; shift ;;
+            -*) echo "Usage: crt setup [--prefix DIR] [user...]" >&2; exit 1 ;;
+            *)  users+=("$1"); shift ;;
+        esac
+    done
+    prefix=$(parse_prefix "$prefix") || exit 1
+    require_root setup
+    use_trusted_path
+
+    if [ ${#users[@]} -eq 0 ]; then
+        if [ -n "${SUDO_USER:-}" ]; then
+            users=("$SUDO_USER")
+        else
+            echo "Error: run as 'sudo crt setup' or 'crt setup <user>...'" >&2
+            exit 1
+        fi
+    fi
+
+    # Resolve every user before changing anything.
+    local -a uids=() gids=() homes=()
+    local u entry uid gid home
+    for u in "${users[@]}"; do
+        if ! [[ "$u" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+            echo "Error: invalid user name '$u'" >&2; exit 1
+        fi
+        entry=$(user_entry "$u") || { echo "Error: unknown user '$u'" >&2; exit 1; }
+        IFS=: read -r uid gid home <<< "$entry"
+        uids+=("$uid"); gids+=("$gid"); homes+=("$home")
+    done
+
+    local layout=0
+    if [ -d "$prefix" ]; then
+        check_root_only_path "$prefix" \
+            || { echo "  Fix it with: sudo crt install --prefix $prefix" >&2; exit 1; }
+        make_root_dir "$prefix/home" || exit 1
+        layout=1
+    else
+        echo "crt: no $prefix, so CRT_HOME stays $CRT_DEFAULT_HOME ('sudo crt install' creates the layout)"
+    fi
+
+    local cgroot="$CRT_SYSROOT/sys/fs/cgroup" i crt_home
+    printf '+memory +cpu\n' > "$cgroot/cgroup.subtree_control" 2>/dev/null \
+        || echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
+    for i in "${!users[@]}"; do
+        u=${users[i]}
+        mkdir -p -- "$cgroot/user-${uids[i]}"
+        chown -R -- "${uids[i]}:${gids[i]}" "$cgroot/user-${uids[i]}"
+        echo "crt: cgroup delegation active for $u (uid=${uids[i]})"
+        crt_home=$CRT_DEFAULT_HOME
+        if [ "$layout" = 1 ]; then
+            crt_home="$prefix/home/$u"
+            setup_user_home "$u" "${uids[i]}" "${gids[i]}" "$crt_home" || exit 1
+        fi
+        warn_home_overlap "$u" "${homes[i]}" "$crt_home"
+    done
+
+    # The cgroup tree does not survive a reboot; runit redoes the delegation.
+    if [ -d "$CRT_SYSROOT/run/runit" ] || [ -f "$CRT_SYSROOT/etc/runit/1" ]; then
+        for u in "${users[@]}"; do register_crt_user "$u"; done
+        install_runit_service
+    else
+        echo "Warning: unrecognised init system — limits active now but won't survive reboot" >&2
+        echo "  Add to your system startup (as root):" >&2
+        printf '    printf '"'"'+memory +cpu\\n'"'"' >> /sys/fs/cgroup/cgroup.subtree_control\n' >&2
+        for i in "${!users[@]}"; do
+            echo "    mkdir -p /sys/fs/cgroup/user-${uids[i]}" >&2
+            echo "    chown -R ${uids[i]}:${gids[i]} /sys/fs/cgroup/user-${uids[i]}" >&2
+        done
+    fi
+}
+
+register_crt_user() {  # user — one name per line in /etc/crt-users
+    local users_file="$CRT_SYSROOT/etc/crt-users"
+    if ! grep -qxF -- "$1" "$users_file" 2>/dev/null; then
+        printf '%s\n' "$1" >> "$users_file"
+        echo "crt: added '$1' to /etc/crt-users"
+    fi
+}
+
+install_runit_service() {
+    local sv_dir="$CRT_SYSROOT/etc/sv/crt-cgroup"
+    local service_dir="$CRT_SYSROOT/var/service"
 
     mkdir -p "$sv_dir"
     cat > "$sv_dir/run" << 'RUNEOF'
@@ -1359,16 +1582,6 @@ exec sleep infinity
 RUNEOF
     chmod +x "$sv_dir/run"
 
-    # Register user in /etc/crt-users (one username per line)
-    if [[ ! "$user" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
-        echo "Error: invalid username '$user'" >&2
-        return 1
-    fi
-    if ! grep -qx "$user" /etc/crt-users 2>/dev/null; then
-        echo "$user" >> /etc/crt-users
-        echo "crt: added '$user' to /etc/crt-users"
-    fi
-
     # Enable service (symlink into active service directory)
     if [ ! -L "$service_dir/crt-cgroup" ]; then
         ln -s "$sv_dir" "$service_dir/crt-cgroup"
@@ -1377,6 +1590,133 @@ RUNEOF
         sv restart crt-cgroup 2>/dev/null || true
         echo "crt: runit service restarted"
     fi
+}
+
+_doc_fail=0
+_doc_warn=0
+doctor_line() {  # level text
+    case "$1" in
+        FAIL) _doc_fail=$((_doc_fail + 1)) ;;
+        warn) _doc_warn=$((_doc_warn + 1)) ;;
+    esac
+    printf '%-5s %s\n' "$1" "$2"
+}
+
+doctor_crt_home() {  # uid user
+    local home_real parent owner mode c clear=1
+    local -a exposures=()
+    doctor_line info "CRT_HOME $CRT_HOME (from $CRT_HOME_FROM)"
+    home_real=$(realpath -m -- "$CRT_HOME")
+    if [ -d "$home_real" ]; then
+        read -r owner mode < <(stat -c '%u %a' -- "$home_real")
+        if [ "$owner" != "$1" ]; then
+            doctor_line FAIL "CRT_HOME is owned by uid $owner, not by you (uid $1)"
+        elif (( 8#$mode & 8#022 )); then
+            doctor_line FAIL "CRT_HOME is writable by group or other (mode $mode): chmod 700 $home_real"
+        else
+            doctor_line ok "CRT_HOME is yours, mode $mode"
+        fi
+    else
+        parent=$(dirname -- "$home_real")
+        if [ -w "$parent" ]; then
+            doctor_line ok "CRT_HOME does not exist yet; crt create makes it"
+        else
+            doctor_line FAIL "CRT_HOME does not exist and $parent is not writable: sudo crt setup $2"
+        fi
+    fi
+    mapfile -t exposures < <(crt_home_exposures)
+    for c in "${exposures[@]}"; do
+        if _paths_overlap "$home_real" "${c%%|*}"; then
+            doctor_line FAIL "CRT_HOME overlaps ${c#*|} (${c%%|*}): hardened runs are refused"
+            clear=0
+        fi
+    done
+    if [ "$clear" = 1 ]; then
+        doctor_line ok "CRT_HOME is outside \$HOME, /tmp and every config mount source"
+    fi
+}
+
+doctor_userns() {
+    local us f
+    if ! us=$(find_unshare); then
+        doctor_line FAIL "unshare not found in /usr/bin, /bin, /usr/sbin or /sbin"
+    elif "$us" --user --map-root-user --mount --pid -f true >/dev/null 2>&1; then
+        doctor_line ok "unprivileged user namespaces work"
+    else
+        doctor_line FAIL "unprivileged user namespaces do not work (unshare --user failed)"
+        for f in /proc/sys/kernel/unprivileged_userns_clone /proc/sys/user/max_user_namespaces; do
+            if [ -r "$f" ]; then doctor_line info "  $f = $(< "$f")"; fi
+        done
+    fi
+}
+
+# doctor_cgroup uid user level — probes what apply_cgroup needs: a delegated
+# user-<uid> cgroup with the memory controller, where this user can create a
+# child, set memory.max and move a process in.
+doctor_cgroup() {
+    local uid="$1" user="$2" lvl="$3"
+    local cgroot="$CRT_SYSROOT/sys/fs/cgroup"
+    local ucg="$cgroot/user-$uid" probe why=""
+    if [ ! -f "$cgroot/cgroup.controllers" ]; then
+        doctor_line "$lvl" "cgroup v2 is not mounted at /sys/fs/cgroup: no memory/cpu limits"
+        return 0
+    fi
+    if [ ! -d "$ucg" ]; then
+        doctor_line "$lvl" "no cgroup delegated to you (/sys/fs/cgroup/user-$uid): sudo crt setup $user"
+        return 0
+    fi
+    if [ ! -w "$ucg" ] || [ ! -w "$ucg/cgroup.procs" ]; then
+        doctor_line "$lvl" "/sys/fs/cgroup/user-$uid is not writable by you: sudo crt setup $user"
+        return 0
+    fi
+    doctor_line ok "cgroup delegated: /sys/fs/cgroup/user-$uid"
+    if ! grep -qw memory "$ucg/cgroup.controllers" 2>/dev/null; then
+        doctor_line "$lvl" "the memory controller is not enabled for user-$uid: sudo crt setup $user"
+        return 0
+    fi
+    printf '+memory +cpu\n' > "$ucg/cgroup.subtree_control" 2>/dev/null || true
+    probe="$ucg/crt-doctor-$$"
+    if ! mkdir "$probe" 2>/dev/null; then
+        doctor_line "$lvl" "cannot create a child cgroup in user-$uid"
+        return 0
+    fi
+    if ! printf '%s\n' 67108864 > "$probe/memory.max" 2>/dev/null; then
+        why="cannot set memory.max in a child of user-$uid"
+    elif ! ( printf '%s\n' "$BASHPID" > "$probe/cgroup.procs" ) 2>/dev/null; then
+        why="cannot move a process into user-$uid: moving one needs write access to the"
+        why+=" cgroup.procs of the common ancestor, so crt must start from inside user-$uid"
+    fi
+    rmdir "$probe" 2>/dev/null || { [ -z "$CRT_TEST_MOCKS" ] || rm -rf -- "$probe"; }
+    if [ -z "$why" ]; then
+        doctor_line ok "memory limits work: set memory.max and joined a child cgroup"
+    else
+        doctor_line "$lvl" "$why"
+    fi
+}
+
+cmd_doctor() {
+    local limits=0 uid user self
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --limits) limits=1; shift ;;
+            *) echo "Usage: crt doctor [--limits]" >&2; exit 1 ;;
+        esac
+    done
+    uid=$(id -u)
+    user=$(id -un 2>/dev/null) || user="uid-$uid"
+    self=$(realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null) || self=$0
+
+    doctor_line info "crt $self, user $user (uid $uid)"
+    doctor_crt_home "$uid" "$user"
+    doctor_userns
+    if [ "$limits" = 1 ]; then doctor_cgroup "$uid" "$user" FAIL
+    else doctor_cgroup "$uid" "$user" warn; fi
+
+    if [ "$_doc_fail" -gt 0 ]; then
+        echo "doctor: $_doc_fail problem(s), $_doc_warn warning(s)"
+        exit 1
+    fi
+    echo "doctor: ready for hardened runs, $_doc_warn warning(s)"
 }
 
 cmd_help() {
@@ -1391,7 +1731,10 @@ Usage:
   crt list                        List chroots
   crt rm <name>                   Remove chroot
   crt export <name> <binary>      Create host wrapper for binary
-  crt setup                       Delegate cgroup to your user (run with sudo)
+  crt install [--prefix DIR]      Install crt as DIR/bin/crt (root), link /usr/local/bin/crt
+  crt setup [--prefix DIR] [user...]
+                                  Delegate a cgroup and make DIR/home/<user> (root)
+  crt doctor [--limits]           Check this user's readiness for hardened runs
 
 run options (flags override the stored config):
   -v, --volume h:c[:ro]   Bind mount host->container; :ro makes it read-only
@@ -1428,9 +1771,20 @@ mount source in a stored config (the default /home/crt is), and a hardened run
 may not bind CRT_HOME, .config or .state (rw or ro), or it is refused.
 Names: letters, digits, '.', '_', '-', starting alphanumeric.
 
+Install layout (DIR defaults to /data/crt):
+  DIR/             root, 755
+  DIR/bin/crt      the installed script, root, 755; /usr/local/bin/crt links to it
+  DIR/home/<user>  that user's CRT_HOME, owned by the user, 700
+  One-time host setup: sudo ./crt install; sudo crt setup <user>...
+  crt doctor reports the resolved CRT_HOME, its placement, user namespaces and
+  the cgroup; it exits 1 on anything that blocks hardened runs (with --limits,
+  also on missing memory limits).
+
 Environment:
-  CRT_HOME    Where chroots are stored (default: /home/crt)
-  CRT_BIN     Where wrappers are created (default: /home/crt/bin)
+  CRT_HOME    Where chroots are stored: $CRT_HOME if set, else
+              /data/crt/home/<user> if it exists, else /home/crt
+  CRT_BIN     Where wrappers are created (default: $CRT_HOME/bin under
+              /data/crt, else /home/crt/bin)
   VOID_REPO   Void Linux package repo (default: https://repo-default.voidlinux.org/current)
 
 Runtime deps:
@@ -1449,6 +1803,13 @@ Examples:
 EOF
 }
 
+CRT_TEST_MOCKS=$(crt_test_mocks) || CRT_TEST_MOCKS=""
+CRT_SYSROOT=""
+if [ -n "$CRT_TEST_MOCKS" ]; then CRT_SYSROOT=${CRT_TEST_SYSROOT:-}; fi
+CRT_DATA_PREFIX="$CRT_SYSROOT/data/crt"
+readonly CRT_TEST_MOCKS CRT_SYSROOT CRT_DATA_PREFIX
+resolve_crt_home
+
 # Main dispatch
 case "${1:-}" in
     create) shift; cmd_create "$@" ;;
@@ -1457,7 +1818,9 @@ case "${1:-}" in
     list|ls) cmd_list ;;
     rm|remove) shift; cmd_rm "$@" ;;
     export) shift; cmd_export "$@" ;;
+    install) shift; cmd_install "$@" ;;
     setup)  shift; cmd_setup "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
         cmd_help

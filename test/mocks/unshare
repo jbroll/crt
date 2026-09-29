@@ -1,6 +1,7 @@
 #!/bin/sh
 # Mock unshare: optionally log args, skip namespace flags, exec the remaining command
 [ -n "$CRT_MOCK_LOG" ] && echo "unshare $*" >> "$CRT_MOCK_LOG"
+[ -n "$CRT_MOCK_UNSHARE_FAIL" ] && exit 1
 while [ $# -gt 0 ]; do
     case "$1" in
         --*|-f) shift ;;
