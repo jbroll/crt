@@ -396,8 +396,12 @@ the kernel's delegation rule: moving a process needs write access to the
 `cgroup.procs` of the common ancestor of the source and destination cgroups.
 A process started outside `user-<uid>` (for example in the root cgroup) has
 that ancestor owned by root, so it cannot join its own delegated cgroup, and
-`apply_cgroup` warns and runs without limits. Limits are not needed for
-hardened isolation, so the probe only warns unless `--limits` is given.
+`apply_cgroup` warns and runs without limits; `crt cgroup-exec` (below) is
+the fix. Limits are not needed for hardened isolation, so the probe only
+warns unless `--limits` is given.
+
+`crt home` prints the resolved `CRT_HOME` so callers need not repeat the
+resolution order.
 
 ## Resource limits (cgroups)
 
@@ -415,6 +419,36 @@ each. On runit (Void) `crt setup` also installs
 username listed in `/etc/crt-users` on boot, since the cgroup tree doesn't
 survive a reboot. Other init systems get printed manual steps instead of
 an installed service.
+
+The tree `crt` relies on:
+
+```
+/sys/fs/cgroup/user-<uid>/   owned by the user; +memory +cpu; no processes
+  <leaf>/                    callers, placed by crt cgroup-exec
+  crt-<pid>/                 one per limited run (apply_cgroup)
+  crt-doctor-<pid>/          doctor's probe, removed at once
+```
+
+Two kernel rules shape it. A cgroup with controllers in its
+`subtree_control` may not hold processes, so `user-<uid>` stays empty and
+callers go in a leaf. Moving a process requires write access to the
+`cgroup.procs` of the common ancestor of source and destination, so the
+caller must already be below `user-<uid>`: then the ancestor of the leaf and
+`crt-<pid>` is the user-owned `user-<uid>`.
+
+`crt cgroup-exec <user> [--leaf NAME] -- cmd` gets a caller there. As root
+it enables the root controllers, creates and chowns `user-<uid>` and enables
+`+memory +cpu` below it (the same `delegate_user_cgroup` as `setup`, so it
+works at boot even if `crt-cgroup` has not run yet), creates the leaf
+(default `session`, owned by the user; `crt-*` names are refused so a leaf
+never collides with a run's cgroup), writes its own pid to the leaf's
+`cgroup.procs`, restores the caller's `PATH` and `exec`s the command. The pid
+does not change across `exec`, so the command and everything it forks stay
+in the leaf. The command starts as root; dropping privileges (`chpst -u`,
+`su -l`) is its job, which keeps `cgroup-exec` from having to reproduce
+chpst's or su's handling of groups and environment. There is no systemd-free
+login hook for interactive users, so they start a shell with
+`sudo crt cgroup-exec <user> -- su -l <user>`.
 
 ## Testing
 

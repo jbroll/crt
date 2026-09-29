@@ -12,6 +12,8 @@
 #   crt install [--prefix DIR]      # Install to DIR/bin/crt (root), default /data/crt
 #   crt setup [--prefix DIR] [user...]  # Delegate cgroup, make DIR/home/<user> (root)
 #   crt doctor [--limits]           # Check readiness for hardened runs
+#   crt home                        # Print the resolved CRT_HOME
+#   crt cgroup-exec <user> [--leaf NAME] -- cmd...  # (root) Start cmd in user-<uid>/NAME
 
 set -e
 
@@ -599,12 +601,18 @@ apply_cgroup() {
 
     [ -z "$memory" ] && [ -z "$cpus" ] && return 0
 
-    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+    local cgroot="$CRT_SYSROOT/sys/fs/cgroup"
+    if [ ! -f "$cgroot/cgroup.controllers" ]; then
         echo "Warning: cgroup v2 not available, resource limits not applied" >&2
         return 0
     fi
 
-    local user_cg="/sys/fs/cgroup/user-$(id -u)"
+    # The run's cgroup is a direct child of user-<uid>, a sibling of the leaf
+    # crt cgroup-exec starts callers in, so the move below has the user-owned
+    # user-<uid> as its common ancestor, and user-<uid> itself holds no
+    # processes (cgroup v2's no-internal-processes rule).
+    local user_cg
+    user_cg="$cgroot/user-$(id -u)"
     if [ ! -d "$user_cg" ]; then
         echo "Warning: cgroup not delegated for your user, resource limits not applied" >&2
         echo "  Run 'sudo crt setup' to enable memory/cpu limits." >&2
@@ -622,6 +630,7 @@ apply_cgroup() {
 
     if ! echo $$ > "$cg/cgroup.procs" 2>/dev/null; then
         echo "Warning: cannot join cgroup, resource limits not applied" >&2
+        echo "  Start the caller inside user-$(id -u): sudo crt cgroup-exec <user> -- ..." >&2
         rmdir "$cg" 2>/dev/null
         return 0
     fi
@@ -1522,13 +1531,11 @@ cmd_setup() {
         echo "crt: no $prefix, so CRT_HOME stays $CRT_DEFAULT_HOME ('sudo crt install' creates the layout)"
     fi
 
-    local cgroot="$CRT_SYSROOT/sys/fs/cgroup" i crt_home
-    printf '+memory +cpu\n' > "$cgroot/cgroup.subtree_control" 2>/dev/null \
-        || echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
+    local i crt_home
+    enable_root_controllers
     for i in "${!users[@]}"; do
         u=${users[i]}
-        mkdir -p -- "$cgroot/user-${uids[i]}"
-        chown -R -- "${uids[i]}:${gids[i]}" "$cgroot/user-${uids[i]}"
+        delegate_user_cgroup "${uids[i]}" "${gids[i]}" || exit 1
         echo "crt: cgroup delegation active for $u (uid=${uids[i]})"
         crt_home=$CRT_DEFAULT_HOME
         if [ "$layout" = 1 ]; then
@@ -1551,6 +1558,72 @@ cmd_setup() {
             echo "    chown -R ${uids[i]}:${gids[i]} /sys/fs/cgroup/user-${uids[i]}" >&2
         done
     fi
+}
+
+enable_root_controllers() {
+    printf '+memory +cpu\n' > "$CRT_SYSROOT/sys/fs/cgroup/cgroup.subtree_control" 2>/dev/null \
+        || echo "Warning: could not enable controllers in root cgroup (requires cgroup v2)" >&2
+}
+
+# delegate_user_cgroup uid gid — user-<uid> exists, belongs to the user, and
+# passes memory+cpu to its children. It must hold no processes itself; callers
+# live in a leaf (crt cgroup-exec) and crt runs in sibling crt-<pid> cgroups.
+delegate_user_cgroup() {
+    local ucg="$CRT_SYSROOT/sys/fs/cgroup/user-$1"
+    if [ -L "$ucg" ]; then echo "Error: $ucg is a symlink." >&2; return 1; fi
+    mkdir -p -- "$ucg" && chown -R -- "$1:$2" "$ucg" || return 1
+    printf '+memory +cpu\n' > "$ucg/cgroup.subtree_control" 2>/dev/null \
+        || echo "Warning: could not enable memory/cpu below user-$1 (does it hold processes itself?)" >&2
+    return 0
+}
+
+# crt cgroup-exec USER [--leaf NAME] -- CMD...: as root, move into
+# user-<uid>/<leaf> (owned by the user) and exec CMD there. CMD starts as root
+# and must drop privileges itself (chpst -u, su -l). Everything it starts can
+# then move into its own crt-<pid> sibling, which is what crt run needs.
+cmd_cgroup_exec() {
+    local user="" leaf=session caller_path entry uid gid ucg leafdir
+    local usage="Usage: crt cgroup-exec <user> [--leaf NAME] -- cmd [args...]"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --leaf)   [ $# -ge 2 ] || { echo "$usage" >&2; exit 1; }
+                      leaf="$2"; shift 2 ;;
+            --leaf=*) leaf="${1#--leaf=}"; shift ;;
+            --) shift; break ;;
+            -*) echo "$usage" >&2; exit 1 ;;
+            *)  [ -z "$user" ] || { echo "$usage" >&2; exit 1; }
+                user="$1"; shift ;;
+        esac
+    done
+    if [ -z "$user" ] || [ $# -eq 0 ]; then echo "$usage" >&2; exit 1; fi
+    if ! [[ "$user" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+        echo "Error: invalid user name '$user'" >&2; exit 1
+    fi
+    if ! [[ "$leaf" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || [[ "$leaf" == crt-* ]]; then
+        echo "Error: invalid leaf '$leaf' (letters, digits, '.', '_', '-'; not crt-*)" >&2
+        exit 1
+    fi
+    require_root cgroup-exec
+    caller_path=$PATH
+    use_trusted_path
+
+    entry=$(user_entry "$user") || { echo "Error: unknown user '$user'" >&2; exit 1; }
+    IFS=: read -r uid gid _ <<< "$entry"
+    if [ ! -f "$CRT_SYSROOT/sys/fs/cgroup/cgroup.controllers" ]; then
+        echo "Error: cgroup v2 is not mounted at /sys/fs/cgroup" >&2; exit 1
+    fi
+    enable_root_controllers
+    delegate_user_cgroup "$uid" "$gid" || exit 1
+
+    ucg="$CRT_SYSROOT/sys/fs/cgroup/user-$uid"
+    leafdir="$ucg/$leaf"
+    if [ -L "$leafdir" ]; then echo "Error: $leafdir is a symlink." >&2; exit 1; fi
+    mkdir -p -- "$leafdir" && chown -R -- "$uid:$gid" "$leafdir" || exit 1
+    if ! printf '%s\n' "$$" > "$leafdir/cgroup.procs"; then
+        echo "Error: cannot move into $leafdir" >&2; exit 1
+    fi
+    export PATH="$caller_path"
+    exec -- "$@"
 }
 
 register_crt_user() {  # user — one name per line in /etc/crt-users
@@ -1685,6 +1758,7 @@ doctor_cgroup() {
     elif ! ( printf '%s\n' "$BASHPID" > "$probe/cgroup.procs" ) 2>/dev/null; then
         why="cannot move a process into user-$uid: moving one needs write access to the"
         why+=" cgroup.procs of the common ancestor, so crt must start from inside user-$uid"
+        why+=" (start the caller with: sudo crt cgroup-exec $user -- ...)"
     fi
     rmdir "$probe" 2>/dev/null || { [ -z "$CRT_TEST_MOCKS" ] || rm -rf -- "$probe"; }
     if [ -z "$why" ]; then
@@ -1735,6 +1809,10 @@ Usage:
   crt setup [--prefix DIR] [user...]
                                   Delegate a cgroup and make DIR/home/<user> (root)
   crt doctor [--limits]           Check this user's readiness for hardened runs
+  crt home                        Print the resolved CRT_HOME
+  crt cgroup-exec <user> [--leaf NAME] -- cmd...
+                                  (root) Run cmd in user-<uid>/NAME (default
+                                  session) so crt run can apply memory/cpu limits
 
 run options (flags override the stored config):
   -v, --volume h:c[:ro]   Bind mount host->container; :ro makes it read-only
@@ -1776,6 +1854,9 @@ Install layout (DIR defaults to /data/crt):
   DIR/bin/crt      the installed script, root, 755; /usr/local/bin/crt links to it
   DIR/home/<user>  that user's CRT_HOME, owned by the user, 700
   One-time host setup: sudo ./crt install; sudo crt setup <user>...
+  Memory/cpu limits need the caller inside user-<uid>. In a runit run script:
+    exec crt cgroup-exec s-ci --leaf NAME -- chpst -u s-ci cmd...
+  For a login shell: sudo crt cgroup-exec <user> -- su -l <user>
   crt doctor reports the resolved CRT_HOME, its placement, user namespaces and
   the cgroup; it exits 1 on anything that blocks hardened runs (with --limits,
   also on missing memory limits).
@@ -1821,6 +1902,8 @@ case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     setup)  shift; cmd_setup "$@" ;;
     doctor) shift; cmd_doctor "$@" ;;
+    cgroup-exec) shift; cmd_cgroup_exec "$@" ;;
+    home)   printf '%s\n' "$CRT_HOME" ;;
     help|--help|-h) cmd_help ;;
     *)
         cmd_help

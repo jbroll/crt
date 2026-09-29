@@ -1214,6 +1214,68 @@ doctor_out -- --limits
 if [ "$drc" = 0 ] && echo "$dout" | grep -q "^ok    memory limits work" \
    && [ -z "$(find "$UCG" -name 'crt-doctor-*')" ]; then Pass; else Fail; fi
 
+Test "run: a limited run's cgroup is crt-<pid> directly under user-<uid>"
+CRT_TEST_SYSROOT="$DSYS" crt_run -m 256M isoenv true >/dev/null 2>&1
+runcg=$(find "$UCG" -mindepth 1 -maxdepth 1 -type d -name 'crt-*' | head -1)
+if [ -n "$runcg" ] && [ "$(cat "$runcg/memory.max")" = 268435456 ]; then Pass; else Fail; fi
+
+# ── crt home ──────────────────────────────────────────────────────────────────
+echo "# crt home"
+
+Test "home: prints \$CRT_HOME when set"
+CompareArgs "$("$CRT" home)" "$CRT_HOME"
+
+Test "home: prints /data/crt/home/<user> when it exists"
+mkdir -p "$LAYOUT/home/$ME"
+CompareArgs "$(env -u CRT_HOME CRT_TEST_SYSROOT="$SYSR" "$CRT" home)" "$LAYOUT/home/$ME"
+
+Test "home: falls back to /home/crt and exits 0"
+rm -rf "$LAYOUT/home/$ME"
+out=$(env -u CRT_HOME CRT_TEST_SYSROOT="$SYSR" "$CRT" home); rc=$?
+if [ "$rc" = 0 ] && [ "$out" = /home/crt ]; then Pass; else Fail; fi
+
+# ── crt cgroup-exec ───────────────────────────────────────────────────────────
+echo "# crt cgroup-exec"
+
+printf 'cpu memory\n' > "$SYSR/sys/fs/cgroup/cgroup.controllers"
+CG990="$SYSR/sys/fs/cgroup/user-990"
+cgexec_root() { CRT_MOCK_PASSWD="$PW" as_root cgroup-exec "$@"; }
+
+Test "cgroup-exec: refuses when not root"
+out=$(CRT_TEST_SYSROOT="$SYSR" CRT_MOCK_PASSWD="$PW" "$CRT" cgroup-exec s-ci -- true 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "must run as root"; then Pass; else Fail; fi
+
+Test "cgroup-exec: requires a user and a command"
+out=$(cgexec_root s-ci 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "Usage: crt cgroup-exec"; then Pass; else Fail; fi
+
+Test "cgroup-exec: refuses a crt-* leaf"
+out=$(cgexec_root s-ci --leaf crt-1 -- true 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "invalid leaf"; then Pass; else Fail; fi
+
+Test "cgroup-exec: refuses an unknown user"
+out=$(cgexec_root nosuch -- true 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q "unknown user"; then Pass; else Fail; fi
+
+Test "cgroup-exec: joins user-<uid>/<leaf>, then execs the command in place"
+: > "$ILOG"
+out=$(cgexec_root s-ci --leaf ci-server -- sh -c 'echo "$$"' 2>/dev/null)
+if [ -n "$out" ] && [ "$(cat "$CG990/ci-server/cgroup.procs")" = "$out" ]; then Pass; else Fail; fi
+
+Test "cgroup-exec: the leaf and user-<uid> belong to the user"
+if grep -qx "chown -R -- 990:991 $CG990" "$ILOG" \
+   && grep -qx "chown -R -- 990:991 $CG990/ci-server" "$ILOG"; then Pass; else Fail; fi
+
+Test "cgroup-exec: enables memory and cpu below user-<uid>"
+if grep -q '+memory +cpu' "$CG990/cgroup.subtree_control"; then Pass; else Fail; fi
+
+Test "cgroup-exec: the default leaf is session"
+cgexec_root s-ci -- true >/dev/null 2>&1
+if [ -s "$CG990/session/cgroup.procs" ]; then Pass; else Fail; fi
+
+Test "cgroup-exec: the command gets the caller's PATH back"
+CompareArgs "$(cgexec_root s-ci -- sh -c 'echo "$PATH"' 2>/dev/null)" "$PATH"
+
 rm -rf "$SYSR" "$DSYS" "$DH"
 
 TestDone

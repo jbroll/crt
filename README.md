@@ -2,8 +2,7 @@
 
 Minimal chroot manager. Creates and runs isolated rootfs environments using Linux namespace primitives — no Docker, no podman.
 
-See [docs/architecture.md](docs/architecture.md) for how it's built and
-[docs/backlog.md](docs/backlog.md) for outstanding work.
+See [docs/architecture.md](docs/architecture.md) for how it's built.
 
 ## How it works
 
@@ -182,6 +181,9 @@ crt export <name> <binary>       Create host wrapper script for a binary
 crt install [--prefix DIR]       Install to DIR/bin/crt (root; default /data/crt)
 crt setup [--prefix DIR] [user…] Delegate cgroups, make DIR/home/<user> (root)
 crt doctor [--limits]            Check readiness for hardened runs
+crt home                         Print the resolved CRT_HOME
+crt cgroup-exec <user> [--leaf NAME] -- cmd…
+                                 (root) Run cmd inside user-<uid>/NAME so limits work
 ```
 
 ### `crt run` flags
@@ -221,6 +223,47 @@ Every user is looked up before anything changes, so an unknown name leaves the
 host untouched. `crt doctor --limits`, run as the user, checks the result.
 
 If `crt setup` hasn't been run, `crt run -m 512M ...` warns and continues without limits.
+
+### Starting callers inside the delegated cgroup
+
+Delegation alone is not enough. `crt run` moves itself into
+`user-<uid>/crt-<pid>`, and the kernel allows that move only if the caller
+can write the `cgroup.procs` of the common ancestor of the old and new
+cgroups. A process started by runit or a login lives outside `user-<uid>`, so
+that ancestor is root's and the move fails (`crt doctor --limits` reports
+"cannot move a process into user-<uid>").
+
+`crt cgroup-exec` fixes this by starting the caller inside the delegated
+subtree. As root, it redoes the delegation if needed (so it also works at
+boot, before the `crt-cgroup` service), creates `user-<uid>/<leaf>` (default
+`session`) owned by the user, moves itself in and execs the command. The
+command starts as root and must drop privileges itself. Everything it starts,
+including `crt run`, inherits the leaf, and each run's `crt-<pid>` cgroup is a
+sibling of the leaf, so the move stays inside the user's own `user-<uid>`:
+
+```
+/sys/fs/cgroup/user-<uid>/      the user's; holds no processes itself
+  ci-server/                    leaf: the service and everything it starts
+  crt-<pid>/                    one per limited crt run
+```
+
+A runit service, for example `/etc/sv/ci-server/run`:
+
+```sh
+#!/bin/sh
+exec /usr/local/bin/crt cgroup-exec s-ci --leaf ci-server -- \
+    chpst -u s-ci /home/john/src/simple-ci/ci-server.tcl ...
+```
+
+Without systemd there is no login hook we know of that puts a session inside
+`user-<uid>`, so an interactive user starts a shell inside the leaf by hand:
+
+```sh
+sudo crt cgroup-exec john -- su -l john
+```
+
+Commands run from that shell get limits; `crt doctor --limits` in it should
+pass.
 
 **Supported init systems:** runit (Void Linux). Other init systems receive manual startup instructions from `crt setup`.
 
@@ -398,7 +441,14 @@ OCI layers are cached in `.cache/layers/` and reused across environments. There 
 ```sh
 bash test/test-crt.sh         # mock-level: parsing and generated calls, no root
 bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
+sudo bash test/test-cgroup.sh [user]   # real cgroups; skips unless root
 ```
+
+`test/test-cgroup.sh` runs `crt cgroup-exec` for a real non-root user
+(default `$SUDO_USER`): the command lands in `user-<uid>/<leaf>`, both are
+owned by the user with memory enabled below `user-<uid>`, and `crt doctor
+--limits` passes from inside the leaf and reports the refused move from
+outside it. It removes the leaf afterwards.
 
 `test/test-crt.sh` uses PATH-based mocks (`test/mocks/`) that shadow system commands:
 
@@ -425,7 +475,7 @@ and `CRT_TEST_EUID`, which stands in for the effective uid, so `install`,
 `setup` and `doctor` run against a fake host. The suite keeps `CRT_HOME` under `/var/tmp`, and a `crt_run` helper
 re-marks the mock rootfs pristine before each run (standing in for `crt
 create`). This lets the full `cmd_create` and `cmd_run` code paths run without
-root, namespaces, network, or xbps. 197 tests cover `parse_memory`,
+root, namespaces, network, or xbps. 210 tests cover `parse_memory`,
 `read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
 `write_config`, `parse_image_ref`, all three `create` dispatch paths (with the
@@ -445,8 +495,10 @@ out-of-rootfs config and safe legacy migration, a symlinked `CRT_HOME`,
 `list`, `rm`, `export`, the `CRT_HOME` resolution order, `install` (root
 check, owner and mode, the link, idempotence, unsafe prefixes), `setup`
 (per-user `CRT_HOME` dirs for several users, a service account, `SUDO_USER`,
-the home-overlap warning, runit registration, refusals), and `doctor` (each
-check and its exit code).
+the home-overlap warning, runit registration, refusals), `doctor` (each
+check and its exit code), `home`, `cgroup-exec` (the leaf, its owner, the
+exec in place, the caller's `PATH`, refusals), and a limited run's
+`crt-<pid>` cgroup sitting directly under `user-<uid>`.
 
 `test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
 (bind-mounted read-only) and proves, in real namespaces, mostly from one run
@@ -470,7 +522,7 @@ under `/var/tmp`. 39 checks.
 ## Limitations
 
 - No private registry authentication
-- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup)). Moving a process into `user-<uid>` also needs write access to the common ancestor cgroup's `cgroup.procs`, so limits apply only when `crt` starts from a process already inside `user-<uid>`; `crt doctor --limits` tests this
+- Resource limits (`memory`/`cpus`) require one-time root setup — run `sudo crt setup` (see [Setup](#setup)). Limits also need the caller to start inside `user-<uid>`: use `crt cgroup-exec` in the run script or for a login shell (see [Starting callers inside the delegated cgroup](#starting-callers-inside-the-delegated-cgroup))
 - `--net none` isolates the network but provides no NAT/bridge, so the container has loopback only (no outbound access)
 - **Default mode is not a sandbox.** A default run has your authority over the
   host and can modify any rootfs, config or marker under `CRT_HOME`. Never run
