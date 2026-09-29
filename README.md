@@ -13,18 +13,47 @@ Minimal chroot manager. Creates and runs isolated rootfs environments using Linu
 - **IPC namespace** (`--ipc`) — isolated shared memory
 - **Net namespace** (`--net`, opt-in via `--net none`) — no host network, loopback only
 
-`crt` enters the rootfs with `pivot_root` and detaches the old root, so the
-host filesystem is gone from the container's mount tree — a process that is
-root inside the namespace cannot walk back out to it. (Plain `chroot` can be
-escaped by in-namespace root; `pivot_root` closes that.)
+`crt` enters the rootfs with `pivot_root` and unconditionally detaches the old
+root, so the host filesystem is gone from the container's mount tree — a
+process that is root inside the namespace cannot walk back out to it. (Plain
+`chroot` can be escaped by in-namespace root; `pivot_root` closes that.) It
+verifies the old root is gone and aborts if it is not.
 
-By default `$HOME` and the host `/tmp` are bind-mounted in. `/proc`, `/sys`,
-`/dev`, and `/etc/resolv.conf` are mounted for a functional environment. The
-`run` options below drop or replace these for running untrusted code.
+By default `$HOME` and the host `/tmp` are bind-mounted in, `/proc` and
+`/etc/resolv.conf` are set up, and a minimal `/dev` is built (only `null`,
+`zero`, `full`, `random`, `urandom`, `tty`, a fresh `devpts`, and a private
+`/dev/shm`). The host `/dev` is never bind-mounted whole, so container block and
+input devices are never exposed. The `run` options below drop or replace the
+host bindings for running untrusted code.
 
-The command inherits the caller's open file descriptors (above stdio), so a
-parent process can hand it an IPC channel — e.g. Node's `NODE_CHANNEL_FD` from
-a `fork()`/`spawn(..., {stdio: [...,'ipc']})` — and it works inside.
+### Hardened mode
+
+Any isolation option (`--net none`, `--no-home`, `--tmp private`, a `:ro` bind,
+`--clean-env`, or `--ro-root`) turns on hardened mode:
+
+- **Fail closed.** Every mount and setup step the isolation depends on must
+  succeed or `crt` exits non-zero before the command runs. There is no silent
+  fallback to `chroot` when `pivot_root` fails.
+- **No capabilities.** After the mounts are set up and the old root detached,
+  the command is exec'd through `setpriv --no-new-privs --bounding-set=-all
+  --inh-caps=-all --ambient-caps=-all`. It runs as uid 0 (so it can write files
+  the caller owns in `rw` binds) but with an empty capability set, so it cannot
+  remount a `:ro` bind read-write, remount the root, unmount a bind to expose
+  what is under it, or create new mounts.
+- **Read-only binds verified.** A `:ro` bind is remounted read-only (recursively
+  where the kernel supports it) and then checked with `findmnt`; a still-writable
+  mount or submount aborts the run.
+
+Without any isolation option, `crt run` behaves as before: the command runs as
+root with capabilities, so `crt run ubuntu apt install -y perl` still works.
+
+### File descriptors
+
+File descriptors above stderr are closed before the command runs, except those
+named with `--keep-fd N` (repeatable) and — when `-e NODE_CHANNEL_FD` is passed
+— the fd named by `NODE_CHANNEL_FD`. This lets a parent hand the command an IPC
+channel, e.g. Node's `fork()`/`spawn(..., {stdio: [...,'ipc']})`, while a fd the
+caller leaked without `O_CLOEXEC` does not become a handle outside the sandbox.
 
 ## Installation
 
@@ -63,6 +92,7 @@ Short flags (`-v -e -m -c`) accept an attached (`-v/x:/y`) or separate (`-v /x:/
 | `--tmp private\|host` | `private` = fresh tmpfs on `/tmp`; default `host` binds the host `/tmp` |
 | `--clean-env` | Start from an empty environment plus a minimal `PATH` and `HOME=/tmp`, then apply `-e` entries |
 | `--ro-root` | Mount the rootfs itself read-only |
+| `--keep-fd N` | Keep file descriptor `N` open in the command (repeatable); otherwise fds above stderr are closed |
 
 ## Setup
 
@@ -156,6 +186,7 @@ The file is copied verbatim to `$CRT_HOME/myenv/config` and used as the source o
 | `tmp` | no | `private` for a tmpfs `/tmp`, or `host` (default) |
 | `env-clean` | no | `yes` to start from a clean minimal environment |
 | `root` | no | `ro` to mount the rootfs read-only (default `rw`) |
+| `keep-fd` | yes | Space-separated fd numbers to keep open in the command |
 
 The `packages` directive is honored only when creating a Void (xbps) rootfs
 from a config file, e.g. `crt create sandbox ./sandbox.conf`.
@@ -186,9 +217,10 @@ Add `CRT_BIN` to your `PATH` and the binary behaves as if installed on the host.
 | `crt create <name>` (Void) | `xbps-install` |
 | `crt create <name> <image>` (OCI) | `curl`, `jq`, `tar` |
 | `crt run` / `crt enter` | `unshare`, `pivot_root`, `chroot` (util-linux) |
+| `crt run` (hardened) | also `setpriv`, `findmnt` (util-linux) and `realpath` (coreutils), inside the rootfs |
 | `crt setup` | root or `sudo` |
 
-`unshare`, `pivot_root`, and `chroot` are in `util-linux`, present on any Linux system. `curl` and `jq` are only needed for OCI pulls. Read-only bind verification and `--tmp private` use kernel features present on any modern (5.x) kernel.
+`unshare`, `pivot_root`, `chroot`, `setpriv`, and `findmnt` are in `util-linux`, present on any Linux system. In hardened mode `setpriv`, `findmnt`, and `realpath` must exist **inside the rootfs** (they run after `pivot_root`); a Void `base-minimal` or the `-v /usr:/usr:ro` used for the eval sandbox provides them. `curl` and `jq` are only needed for OCI pulls. Read-only bind verification and `--tmp private` use kernel features present on any modern (5.x) kernel.
 
 User namespace support must be enabled on the host kernel (`/proc/sys/kernel/unprivileged_userns_clone` = 1 on some distros).
 
@@ -227,15 +259,33 @@ bash test/test-isolation.sh   # real namespaces; skips if userns is unavailable
 | Mock | Replaces | What it does |
 |---|---|---|
 | `unshare` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), strips namespace flags, runs the inner script on the host |
-| `pivot_root` | util-linux | Always fails, so `cmd_run` falls back to `chroot` (no real mount namespace under test) |
+| `pivot_root` | util-linux | Always fails, so with `CRT_TEST_MODE=1` `cmd_run` falls back to `chroot` (no real mount namespace under test) |
 | `chroot` | util-linux | Drops the rootfs arg, runs the command on the host filesystem |
 | `mount` | util-linux | Logs its args (when `CRT_MOCK_LOG` is set), then no-op |
 | `curl` | curl | Returns canned token/manifest JSON and a generated tar for blob requests |
 | `xbps-install` | xbps | Creates a minimal `bin/sh` skeleton in the rootfs |
 
-This lets the full `cmd_create` and `cmd_run` code paths run without root, namespaces, network, or xbps. 90 tests cover `parse_memory`, `read_config` (including the `net`/`home`/`tmp`/`env-clean`/`root`/`packages` directives), `write_config`, `parse_image_ref`, all three `create` dispatch paths, `run` flag and config merging, the generated `unshare`/`mount` calls for each isolation flag, clean-env behavior, inherited file descriptors, `list`, `rm`, OCI layer cache reuse, `export`, and `setup`.
+`test/test-crt.sh` exports `CRT_TEST_MODE=1`, a test-only switch that lets
+`cmd_run` fall back to `chroot` (and skip read-only verification) when the mock
+`pivot_root` fails, instead of aborting. Real runs never set it. This lets the
+full `cmd_create` and `cmd_run` code paths run without root, namespaces,
+network, or xbps. 96 tests cover `parse_memory`, `read_config` (including the
+`net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
+`write_config`, `parse_image_ref`, all three `create` dispatch paths, `run` flag
+and config merging, the generated `unshare`/`mount` calls for each isolation
+flag, clean-env behavior, `--keep-fd` and fd closing, `list`, `rm`, OCI layer
+cache reuse, `export`, and `setup`.
 
-`test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr` (bind-mounted read-only) and proves, in real namespaces, that `--net none` blocks the network, `--no-home` hides `$HOME`, `--tmp private` hides the host `/tmp`, `:ro` binds reject writes, `--clean-env` drops caller variables while keeping passed-through ones, and an inherited fd is readable inside.
+`test/test-isolation.sh` builds a throwaway rootfs that reuses the host `/usr`
+(bind-mounted read-only) and proves, in real namespaces, mostly from one run
+with the full flag set (`--net none --no-home --tmp private --clean-env
+--ro-root` plus a `:ro` bind and `--keep-fd`): the old root is gone, the command
+is capless (cannot remount, unmount, or create mounts), `$HOME` and the host
+`/tmp` are hidden, the minimal `/dev` has no block/input devices but a working
+`/dev/null`, `:ro` binds reject writes, the clean environment is minimal, a kept
+fd is readable while an unlisted one is closed, `NODE_CHANNEL_FD` is kept
+automatically, `--net none` blocks the network, and a default run is unchanged
+(uid 0 with capabilities, `$HOME` visible). 23 checks.
 
 ## Limitations
 

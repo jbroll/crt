@@ -215,11 +215,12 @@ read_config() {
     config_envclean=""
     config_root=""
     config_packages=()
+    config_keepfds=()
 
     [ -f "$config_file" ] || return 0
 
     local key val
-    local -a _pkgs
+    local -a _pkgs _fds
     while read -r key val; do
         case "$key" in
             '#'*|'') continue ;;
@@ -240,6 +241,7 @@ read_config() {
             env-clean) config_envclean="$val" ;;
             root)      config_root="$val" ;;
             packages)  read -ra _pkgs <<< "$val"; config_packages+=("${_pkgs[@]}") ;;
+            keep-fd)   read -ra _fds <<< "$val"; config_keepfds+=("${_fds[@]}") ;;
         esac
     done < "$config_file"
 }
@@ -385,7 +387,7 @@ cmd_create() {
     elif [ -f "$arg" ]; then
         local config_image="" config_memory="" config_cpus=""
         local config_net="" config_home="" config_tmp="" config_envclean="" config_root=""
-        local -a config_mounts=() config_envs=() config_packages=()
+        local -a config_mounts=() config_envs=() config_packages=() config_keepfds=()
         read_config "$arg"
         if [ -z "$config_image" ] || [ "$config_image" = "void" ]; then
             _create_xbps "$rootfs"
@@ -414,7 +416,7 @@ cmd_enter() {
 }
 
 cmd_run() {
-    local -a flag_mounts=() flag_envs=()
+    local -a flag_mounts=() flag_envs=() flag_keepfds=()
     local flag_memory="" flag_cpus=""
     local flag_net="" flag_home="" flag_tmp="" flag_cleanenv="" flag_roroot=""
 
@@ -439,6 +441,8 @@ cmd_run() {
                     flag_net="$2"; shift 2 ;;
             --tmp)  [ $# -ge 2 ] || { echo "Error: --tmp requires an argument" >&2; exit 1; }
                     flag_tmp="$2"; shift 2 ;;
+            --keep-fd)  [ $# -ge 2 ] || { echo "Error: --keep-fd requires an argument" >&2; exit 1; }
+                    flag_keepfds+=("$2"); shift 2 ;;
             --no-home)   flag_home="no"; shift ;;
             --clean-env) flag_cleanenv="yes"; shift ;;
             --ro-root)   flag_roroot="ro"; shift ;;
@@ -469,12 +473,13 @@ cmd_run() {
     # Load stored config
     local config_image="" config_memory="" config_cpus=""
     local config_net="" config_home="" config_tmp="" config_envclean="" config_root=""
-    local -a config_mounts=() config_envs=() config_packages=()
+    local -a config_mounts=() config_envs=() config_packages=() config_keepfds=()
     read_config "$rootfs/config"
 
     # Merge: config first, flags override/extend
     local -a all_mounts=("${config_mounts[@]}" "${flag_mounts[@]}")
     local -a all_envs=("${config_envs[@]}" "${flag_envs[@]}")
+    local -a all_keepfds=("${config_keepfds[@]}" "${flag_keepfds[@]}")
     local memory="${flag_memory:-$config_memory}"
     local cpus="${flag_cpus:-$config_cpus}"
     local net_mode="${flag_net:-${config_net:-host}}"
@@ -505,20 +510,45 @@ cmd_run() {
     case "$clean_mode" in yes|true|1|clean) clean_env=1 ;; no|false|0|"") : ;;
         *) echo "Error: invalid env-clean mode '$clean_mode' (use yes|no)" >&2; exit 1 ;; esac
 
+    # Hardened when any isolation is requested: setup fails closed and the
+    # command runs with all capabilities dropped (see the inner script).
+    local hardened=0
+    if [ "$no_home" = 1 ] || [ "$private_tmp" = 1 ] || [ "$net_none" = 1 ] \
+       || [ "$ro_root" = 1 ] || [ "$clean_env" = 1 ]; then
+        hardened=1
+    fi
+    for spec in "${all_mounts[@]}"; do
+        case "$spec" in *:*:ro) hardened=1 ;; esac
+    done
+
     # Resolve env entries in the parent, where the caller's environment is visible.
     #   NAME=value  -> passed through as-is
     #   NAME        -> substituted with the caller's current value (skipped if unset)
+    # A passed-through NODE_CHANNEL_FD value is also kept open (see keep-fd below).
     local -a resolved_envs=()
-    local env_spec
+    local env_spec name value
     for env_spec in "${all_envs[@]}"; do
         if [[ "$env_spec" == *=* ]]; then
-            resolved_envs+=("$env_spec")
+            resolved_envs+=("$env_spec"); name=${env_spec%%=*}; value=${env_spec#*=}
         elif [ -n "${!env_spec+x}" ]; then
-            resolved_envs+=("$env_spec=${!env_spec}")
+            name=$env_spec; value=${!env_spec}; resolved_envs+=("$name=$value")
         else
             echo "Warning: -e $env_spec: not set in environment, skipping" >&2
+            continue
+        fi
+        if [ "$name" = NODE_CHANNEL_FD ] && [[ "$value" =~ ^[0-9]+$ ]]; then
+            all_keepfds+=("$value")
         fi
     done
+
+    # Validate the keep-fd list (numeric fds only).
+    local fd
+    for fd in "${all_keepfds[@]}"; do
+        if ! [[ "$fd" =~ ^[0-9]+$ ]]; then
+            echo "Error: --keep-fd '$fd' must be a number" >&2; exit 1
+        fi
+    done
+    local keepfds="${all_keepfds[*]}"
 
     # Minimal environment used only when --clean-env is in effect.
     local minpath="/usr/bin:/bin:/usr/local/bin"
@@ -551,32 +581,70 @@ cmd_run() {
             set +e
             rootfs=$1; userhome=$2; workdir=$3
             no_home=$4; private_tmp=$5; net_none=$6; ro_root=$7; clean_env=$8
-            minpath=$9; shift 9
-            minhome=$1; nmounts=$2; shift 2
+            hardened=$9; shift 9
+            minpath=$1; minhome=$2; keepfds=$3; nmounts=$4; shift 4
 
-            mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev/pts" \
-                     "$rootfs/tmp" "$rootfs/etc" "$rootfs/oldroot"
-            touch "$rootfs/etc/resolv.conf" 2>/dev/null || true
-            mount --make-rprivate / 2>/dev/null || true
+            crt_die() { echo "crt: $1" >&2; exit 1; }
+            # req: always required. hreq: required only in hardened mode.
+            req()  { "$@" && return 0; crt_die "step failed: $*"; }
+            hreq() { "$@" && return 0; [ "$hardened" = 1 ] && crt_die "step failed: $*"; return 0; }
+            # canon: canonical target that must stay under the rootfs (no symlink escape).
+            canon() {
+                local t; t=$(realpath -m -- "$1") || crt_die "cannot resolve $1"
+                case "$t" in "$rootfs"|"$rootfs"/*) printf "%s\n" "$t" ;;
+                    *) crt_die "target escapes rootfs: $1 -> $t" ;; esac
+            }
+            # verify_ro: every mount at/under $1 must be read-only (fail closed).
+            verify_ro() {
+                local out t opts
+                out=$(findmnt -nrR -o TARGET,VFS-OPTIONS -- "$1" 2>/dev/null)
+                [ -n "$out" ] || crt_die "read-only bind not found: $1"
+                while read -r t opts; do
+                    case ",$opts," in *,ro,*) ;; *) crt_die "not read-only: $t ($opts)" ;; esac
+                done <<RO
+$out
+RO
+            }
+
+            mkdir -p "$rootfs/proc" "$rootfs/etc" "$rootfs/oldroot" \
+                     "$rootfs/dev/pts" "$rootfs/dev/shm" "$rootfs/tmp" "$rootfs/sys"
+            hreq mount --make-rprivate /
             # Make the rootfs a mount point first, so every submount below lands
             # on top of it and pivot_root can later use it as the new root.
-            mount --bind "$rootfs" "$rootfs" 2>/dev/null || true
-            mount -t proc proc "$rootfs/proc" 2>/dev/null || true
-            mount --bind /sys "$rootfs/sys" 2>/dev/null \
-                || mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
-            mount --bind /dev "$rootfs/dev" 2>/dev/null || true
-            mount --bind /dev/pts "$rootfs/dev/pts" 2>/dev/null || true
+            hreq mount --bind "$rootfs" "$rootfs"
+            hreq mount -t proc proc "$rootfs/proc"
+            if [ "$net_none" = 1 ]; then
+                mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+            else
+                mount --bind /sys "$rootfs/sys" 2>/dev/null \
+                    || mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+            fi
+
+            # Minimal /dev: bind only safe device nodes (never all of host /dev,
+            # which would expose block/input/kvm devices), plus a fresh devpts and
+            # a private tmpfs /dev/shm. Device nodes are bound onto the rootfs disk
+            # (the kernel forbids device writes on a userns-created tmpfs).
+            for n in null zero full random urandom tty; do
+                [ -e "/dev/$n" ] || continue
+                [ -e "$rootfs/dev/$n" ] || : > "$rootfs/dev/$n"
+                hreq mount --bind "/dev/$n" "$rootfs/dev/$n"
+            done
+            hreq mount -t devpts devpts "$rootfs/dev/pts" -o newinstance,ptmxmode=0666,mode=0620
+            ln -sfn pts/ptmx "$rootfs/dev/ptmx" 2>/dev/null || true
+            hreq mount -t tmpfs tmpfs "$rootfs/dev/shm"
+
+            : > "$rootfs/etc/resolv.conf" 2>/dev/null || true
             mount --bind /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
             if [ "$private_tmp" = 1 ]; then
-                mount -t tmpfs tmpfs "$rootfs/tmp" 2>/dev/null || true
+                hreq mount -t tmpfs tmpfs "$rootfs/tmp"
             else
-                mount --bind /tmp "$rootfs/tmp" 2>/dev/null || true
+                hreq mount --bind /tmp "$rootfs/tmp"
             fi
 
             if [ "$no_home" != 1 ]; then
-                mkdir -p "$rootfs$userhome"
-                mount --bind "$userhome" "$rootfs$userhome" 2>/dev/null || true
+                htgt=$(canon "$rootfs$userhome"); mkdir -p "$htgt"
+                hreq mount --bind "$userhome" "$htgt"
             fi
 
             i=0
@@ -588,33 +656,26 @@ cmd_run() {
                     *:*:rw) spec=${spec%:rw} ;;
                 esac
                 host=${spec%%:*}; container=${spec#*:}
-                mkdir -p "$rootfs$container"
-                if ! mount --rbind "$host" "$rootfs$container" 2>/dev/null; then
-                    echo "crt: bind mount failed: $host -> $container" >&2
-                    exit 1
-                fi
+                tgt=$(canon "$rootfs$container"); mkdir -p "$tgt"
+                req mount --rbind "$host" "$tgt"
                 if [ "$mode" = ro ]; then
-                    mount -o remount,bind,ro=recursive "$rootfs$container" 2>/dev/null \
-                        || mount -o remount,bind,ro "$rootfs$container" 2>/dev/null || true
-                    # Fail closed: refuse to run if any submount is still writable.
-                    bad=$(awk -v t="$rootfs$container" '"'"'
-                        $5==t || index($5,t"/")==1 {
-                            if ($6 !~ /(^|,)ro(,|$)/) print $5
-                        }'"'"' /proc/self/mountinfo 2>/dev/null)
-                    if [ -n "$bad" ]; then
-                        echo "crt: read-only bind not enforced: $bad" >&2
-                        exit 1
-                    fi
+                    mount -o remount,bind,ro=recursive "$tgt" 2>/dev/null \
+                        || req mount -o remount,bind,ro "$tgt"
+                    [ -n "$CRT_TEST_MODE" ] || verify_ro "$tgt"
                 fi
             done
 
-            if [ "$net_none" = 1 ]; then
-                ip link set lo up 2>/dev/null || true
-            fi
+            [ "$net_none" = 1 ] && hreq ip link set lo up
+            [ "$ro_root" = 1 ] && hreq mount -o remount,bind,ro "$rootfs"
 
-            if [ "$ro_root" = 1 ]; then
-                mount -o remount,bind,ro "$rootfs" 2>/dev/null || true
-            fi
+            # Close every fd above stderr except the explicit keep list, so a fd the
+            # caller leaked without O_CLOEXEC cannot be a handle outside the root.
+            for fdp in /proc/self/fd/*; do
+                n=${fdp##*/}
+                [ "$n" -gt 2 ] 2>/dev/null || continue
+                case " $keepfds " in *" $n "*) continue ;; esac
+                eval "exec $n>&-" 2>/dev/null
+            done
 
             # POSIX-sh payload (runs under the rootfs /bin/sh, which may be dash):
             # cd into the work dir, then optionally start from a clean environment.
@@ -631,20 +692,36 @@ cmd_run() {
                 fi
             '"'"'
 
-            cd "$rootfs" 2>/dev/null || cd /
+            cd "$rootfs" 2>/dev/null || crt_die "cannot cd into rootfs"
             if pivot_root . oldroot 2>/dev/null; then
-                umount -l /oldroot 2>/dev/null || true
+                # The old root must be gone before the command runs. No redirect to a
+                # path inside the new root (it may not exist / be read-only), then verify.
+                umount -l /oldroot || crt_die "could not detach old root"
+                [ "$(grep -c " /oldroot" /proc/self/mountinfo)" -eq 0 ] \
+                    || crt_die "old root still mounted after pivot"
                 rmdir /oldroot 2>/dev/null || true
-                exec /bin/sh -c "$payload" crt \
-                    "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
-            else
-                # No real mount namespace (e.g. test mocks): fall back to chroot.
+                if [ "$hardened" = 1 ]; then
+                    { [ -x /usr/bin/setpriv ] || [ -x /bin/setpriv ]; } \
+                        || crt_die "setpriv not found in rootfs (needed to drop privileges)"
+                    exec setpriv --no-new-privs --bounding-set=-all \
+                            --inh-caps=-all --ambient-caps=-all \
+                        /bin/sh -c "$payload" crt \
+                            "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
+                else
+                    exec /bin/sh -c "$payload" crt \
+                        "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
+                fi
+            elif [ -n "$CRT_TEST_MODE" ]; then
+                # Test-only path (PATH mocks, no real mount namespace): the mock
+                # pivot_root always fails, so fall back to chroot to exercise the code.
                 exec chroot "$rootfs" /bin/sh -c "$payload" crt \
                     "$workdir" "$clean_env" "$minpath" "$minhome" "$@"
+            else
+                crt_die "pivot_root failed; refusing to run without isolation"
             fi
         ' -- "$rootfs" "$HOME" "$workdir" \
-            "$no_home" "$private_tmp" "$net_none" "$ro_root" "$clean_env" \
-            "$minpath" "$minhome" "${#all_mounts[@]}" "${all_mounts[@]}" \
+            "$no_home" "$private_tmp" "$net_none" "$ro_root" "$clean_env" "$hardened" \
+            "$minpath" "$minhome" "$keepfds" "${#all_mounts[@]}" "${all_mounts[@]}" \
             "${resolved_envs[@]}" "$@"
     local _rc
     _rc=$?
@@ -871,9 +948,15 @@ run options (flags override the stored config):
       --tmp private|host  /tmp: private tmpfs, or the host /tmp bind (default host)
       --clean-env         Start from an empty env plus a minimal PATH and HOME
       --ro-root           Mount the rootfs read-only
+      --keep-fd N         Keep fd N open in the command (repeatable)
 
-The command runs with the caller's open file descriptors (>2) intact, so a
-parent's inherited IPC fd (e.g. Node's NODE_CHANNEL_FD) works.
+Any isolation option turns on hardened mode: setup fails closed (a step that
+cannot be enforced aborts the run), the host root is detached after pivot_root,
+and the command runs with all capabilities dropped (no_new_privs), so it cannot
+remount, unmount, or create mounts. A minimal /dev (null, zero, full, random,
+urandom, tty, a fresh devpts, private shm) is built; the host /dev is never
+exposed. File descriptors above stderr are closed except --keep-fd entries and,
+when -e NODE_CHANNEL_FD is passed, that fd (so Node's IPC channel works).
 
 Environment:
   CRT_HOME    Where chroots are stored (default: /home/crt)

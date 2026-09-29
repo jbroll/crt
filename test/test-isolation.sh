@@ -5,6 +5,11 @@
 # unshare/pivot_root path. It builds a throwaway rootfs that reuses the host's
 # binaries by bind-mounting /usr read-only, so no Void bootstrap or network is
 # needed. It skips cleanly when unprivileged user namespaces are unavailable.
+#
+# The core case runs the full intended flag set together
+#   --net none --no-home --tmp private --clean-env --ro-root -v ...:ro --keep-fd 3
+# and asserts each hardening property from that one run, because that combination
+# (ro-root with the rest) is where a bug can hide.
 
 set -uo pipefail
 
@@ -12,101 +17,123 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRT="$SCRIPT_DIR/../crt"
 
 pass=0 fail=0
-ok()   { printf 'ok     %s\n' "$1"; pass=$((pass + 1)); }
-no()   { printf 'NOT OK %s\n' "$1"; fail=$((fail + 1)); }
-check() { # check "name" "expected" "actual"
-    if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (want [$2] got [$3])"; fi
-}
+ok()  { printf 'ok     %s\n' "$1"; pass=$((pass + 1)); }
+no()  { printf 'NOT OK %s\n' "$1"; fail=$((fail + 1)); }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (want [$2] got [$3])"; fi; }
 
 # ── skip unless unprivileged user + mount namespaces work ─────────────────────
 if ! unshare --user --map-root-user --mount --pid -f true 2>/dev/null; then
     echo "SKIP: unprivileged user namespaces unavailable on this host"
     exit 0
 fi
-if [ ! -x /usr/bin/bash ] && [ ! -x /bin/bash ]; then
-    echo "SKIP: no bash under /usr to drive the /dev/tcp network check"
-fi
 
 # ── throwaway rootfs that borrows the host /usr at run time ───────────────────
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 export CRT_HOME="$WORK/home"
 NAME=iso
 R="$CRT_HOME/$NAME"
-mkdir -p "$R"/{etc,proc,sys,dev,tmp,oldroot,usr/bin,usr/lib}
+mkdir -p "$R"/{etc,proc,dev,tmp,usr/bin,usr/lib}
 for d in bin lib lib64 sbin; do
     t="$(readlink "/$d" 2>/dev/null)" && ln -s "$t" "$R/$d"
 done
-printf 'image void\n' > "$R/config"          # marks it as a real env for crt
+printf 'image void\n' > "$R/config"
 
-USR_RO=(-v /usr:/usr:ro)                       # every run needs the host binaries
+HOST_HOME_CANARY="$HOME/.crt_iso_canary.$$"
+echo secret > "$HOST_HOME_CANARY" 2>/dev/null || HOST_HOME_CANARY=""
+TMP_MARKER=".crt_iso_tmp.$$"
+echo secret > "/tmp/$TMP_MARKER"
+trap 'rm -f "$HOST_HOME_CANARY" "/tmp/$TMP_MARKER"; rm -rf "$WORK"' EXIT
 
-# markers on the host that the guest must NOT see
-HOST_HOME_MARKER="$HOME/.crt_iso_home_marker.$$"
-echo secret > "$HOST_HOME_MARKER" 2>/dev/null || HOST_HOME_MARKER=""
-HOST_TMP_MARKER="/tmp/.crt_iso_tmp_marker.$$"
-echo secret > "$HOST_TMP_MARKER"
-cleanup_markers() { rm -f "$HOST_HOME_MARKER" "$HOST_TMP_MARKER"; }
-trap 'cleanup_markers; rm -rf "$WORK"' EXIT
-
-# a read-only bind source with content
-ROSRC="$WORK/rosrc"; mkdir -p "$ROSRC"; echo readonly > "$ROSRC/file"
-
-# a file whose fd we hand to the child
+ROSRC="$WORK/rosrc"; mkdir -p "$ROSRC"; echo readonly > "$ROSRC/f"
 FDFILE="$WORK/fd.txt"; echo fd-payload-42 > "$FDFILE"
+
+USR_RW=(-v /usr:/usr)          # non-hardened runs: rw bind of the host binaries
+USR_RO=(-v /usr:/usr:ro)       # hardened runs: read-only
 
 echo "# crt isolation integration"
 
-# 1. network isolation: connecting out must fail under --net none
-netcheck='exec 3<>/dev/tcp/1.1.1.1/53'
-bash_in_guest=/usr/bin/bash
+# ── combined hardened run: capture many probes from one invocation ────────────
+PROBE='c=$1
+echo "UID=$(id -u)"
+echo "CAP=$(awk "/^CapEff/{print \$2}" /proc/self/status)"
+echo "OLDROOT=$(grep -c " /oldroot " /proc/self/mountinfo)"
+[ -e "$c" ] && echo "CANARY=visible" || echo "CANARY=hidden"
+[ -e "/tmp/'"$TMP_MARKER"'" ] && echo "TMP=visible" || echo "TMP=hidden"
+echo "DEVNULL=$(echo x >/dev/null 2>/dev/null && echo ok || echo fail)"
+echo "URANDOM=$(head -c2 /dev/urandom >/dev/null 2>&1 && echo ok || echo fail)"
+echo "BLOCKDEV=$(ls /dev 2>/dev/null | grep -cE "^(sd|nvme|loop[0-9]|kvm|input|video[0-9]|dri|mem)$")"
+echo "ROREAD=$(cat /ro/f 2>/dev/null)"
+echo "ROWRITE=$(echo x >/ro/zz 2>/dev/null && echo wrote || echo ro)"
+echo "REMOUNT_ROBIND=$(mount -o remount,rw,bind /ro 2>/dev/null && echo opened || echo blocked)"
+echo "REMOUNT_ROOT=$(mount -o remount,rw,bind / 2>/dev/null && echo opened || echo blocked)"
+echo "NEWTMPFS=$(mount -t tmpfs x /proc 2>/dev/null && echo mounted || echo blocked)"
+echo "NEWPROC=$(mount -t proc p /proc 2>/dev/null && echo mounted || echo blocked)"
+echo "UMOUNT=$(umount /ro 2>/dev/null && echo unmounted || echo blocked)"
+echo "FD3=$(cat <&3 2>/dev/null || echo no-fd)"
+echo "ENVCOUNT=$(env | grep -c .)"'
+
+OUT="$("$CRT" run --net none --no-home --tmp private --clean-env --ro-root \
+        "${USR_RO[@]}" -v "$ROSRC:/ro:ro" --keep-fd 3 \
+        "$NAME" /bin/bash -c "$PROBE" bash "$HOST_HOME_CANARY" \
+        3<"$FDFILE" 2>/dev/null)"
+field() { printf '%s\n' "$OUT" | sed -n "s/^$1=//p"; }
+
+check "combined: command runs as uid 0"            "0"       "$(field UID)"
+check "combined: all capabilities dropped"         "0000000000000000" "$(field CAP)"
+check "combined: old root is gone"                 "0"       "$(field OLDROOT)"
+if [ -n "$HOST_HOME_CANARY" ]; then
+    check "combined: \$HOME canary unreachable"     "hidden"  "$(field CANARY)"
+else
+    ok "combined: \$HOME canary unwritable, skipped"
+fi
+check "combined: host /tmp not visible"            "hidden"  "$(field TMP)"
+check "combined: /dev/null works"                  "ok"      "$(field DEVNULL)"
+check "combined: /dev/urandom works"               "ok"      "$(field URANDOM)"
+check "combined: no block/input devices in /dev"   "0"       "$(field BLOCKDEV)"
+check "combined: ro bind is readable"              "readonly" "$(field ROREAD)"
+check "combined: ro bind rejects writes"           "ro"      "$(field ROWRITE)"
+check "combined: cannot remount ro bind rw"        "blocked" "$(field REMOUNT_ROBIND)"
+check "combined: cannot remount root rw"           "blocked" "$(field REMOUNT_ROOT)"
+check "combined: cannot mount a new tmpfs"         "blocked" "$(field NEWTMPFS)"
+check "combined: cannot mount a new proc"          "blocked" "$(field NEWPROC)"
+check "combined: cannot umount a bind"             "blocked" "$(field UMOUNT)"
+check "combined: kept fd (3) is readable"          "fd-payload-42" "$(field FD3)"
+envc="$(field ENVCOUNT)"
+if [ -n "$envc" ] && [ "$envc" -gt 0 ] && [ "$envc" -lt 8 ]; then
+    ok "combined: clean environment is minimal ($envc vars)"
+else
+    no "combined: clean environment not minimal ($envc vars)"
+fi
+
+# ── network isolation (separate run: the connect must fail) ───────────────────
+NETCHK='exec 3<>/dev/tcp/1.1.1.1/53'
 result="$("$CRT" run --net none "${USR_RO[@]}" "$NAME" \
-    "$bash_in_guest" -c "timeout 5 $bash_in_guest -c '$netcheck' 2>/dev/null && echo UP || echo DOWN" \
+    /usr/bin/bash -c "timeout 5 /usr/bin/bash -c '$NETCHK' 2>/dev/null && echo UP || echo DOWN" \
     2>/dev/null)"
 check "network is unreachable with --net none" "DOWN" "$result"
 
-# 2. $HOME is not visible with --no-home
-if [ -n "$HOST_HOME_MARKER" ]; then
-    result="$("$CRT" run --no-home "${USR_RO[@]}" "$NAME" \
-        /bin/sh -c "[ -e '$HOST_HOME_MARKER' ] && echo SEEN || echo HIDDEN" 2>/dev/null)"
-    check "\$HOME is not visible with --no-home" "HIDDEN" "$result"
+# ── an unlisted fd is closed (no --keep-fd) ───────────────────────────────────
+result="$("$CRT" run --clean-env --no-home "${USR_RO[@]}" "$NAME" \
+    /bin/sh -c 'cat <&3 2>/dev/null && echo LEAK || echo closed' 3<"$FDFILE" 2>/dev/null)"
+check "an unlisted fd is closed" "closed" "$result"
+
+# ── NODE_CHANNEL_FD passed with -e is kept open automatically ─────────────────
+result="$(NODE_CHANNEL_FD=3 "$CRT" run --clean-env --no-home -e NODE_CHANNEL_FD "${USR_RO[@]}" "$NAME" \
+    /bin/sh -c 'cat <&3' 3<"$FDFILE" 2>/dev/null)"
+check "NODE_CHANNEL_FD fd kept open automatically" "fd-payload-42" "$result"
+
+# ── default (no isolation flags) stays unchanged: root, caps, home visible ────
+DEF='echo "UID=$(id -u)"
+echo "CAP0=$(awk "/^CapEff/{print \$2}" /proc/self/status | grep -q "^0*$" && echo yes || echo no)"
+[ -e "$1" ] && echo "CANARY=visible" || echo "CANARY=hidden"'
+OUT="$("$CRT" run "${USR_RW[@]}" "$NAME" /bin/bash -c "$DEF" bash "$HOST_HOME_CANARY" 2>/dev/null)"
+check "default: command runs as uid 0"       "0"        "$(printf '%s\n' "$OUT" | sed -n 's/^UID=//p')"
+check "default: capabilities retained"       "no"       "$(printf '%s\n' "$OUT" | sed -n 's/^CAP0=//p')"
+if [ -n "$HOST_HOME_CANARY" ]; then
+    check "default: \$HOME is visible"        "visible"  "$(printf '%s\n' "$OUT" | sed -n 's/^CANARY=//p')"
 else
-    ok "\$HOME marker unwritable, skipped home visibility check"
+    ok "default: \$HOME canary unwritable, skipped"
 fi
-
-# 3. host /tmp is not visible with --tmp private
-result="$("$CRT" run --tmp private "${USR_RO[@]}" "$NAME" \
-    /bin/sh -c "[ -e '$HOST_TMP_MARKER' ] && echo SEEN || echo HIDDEN" 2>/dev/null)"
-check "host /tmp is not visible with --tmp private" "HIDDEN" "$result"
-
-# 4. read-only bind mount rejects writes
-result="$("$CRT" run "${USR_RO[@]}" -v "$ROSRC:/ro:ro" "$NAME" \
-    /bin/sh -c 'echo x > /ro/new 2>/dev/null && echo WROTE || echo RO' 2>/dev/null)"
-check "read-only bind mount is not writable" "RO" "$result"
-
-# 4b. read-only bind is still readable
-result="$("$CRT" run "${USR_RO[@]}" -v "$ROSRC:/ro:ro" "$NAME" \
-    /bin/sh -c 'cat /ro/file' 2>/dev/null)"
-check "read-only bind mount is readable" "readonly" "$result"
-
-# 5. clean env drops caller vars, keeps passed-through and minimal ones
-result="$(CRT_LEAK=should_not_appear PASSME=kept "$CRT" run --clean-env -e PASSME "${USR_RO[@]}" "$NAME" \
-    /usr/bin/env 2>/dev/null | sort | tr '\n' ' ')"
-if echo "$result" | grep -q 'CRT_LEAK'; then
-    no "clean env leaked CRT_LEAK: $result"
-elif echo "$result" | grep -q 'PASSME=kept' && echo "$result" | grep -q 'HOME=/tmp'; then
-    ok "clean env keeps only minimal + passed vars"
-else
-    no "clean env missing PASSME/HOME: $result"
-fi
-
-# 6. an inherited fd is readable inside the guest
-result="$("$CRT" run "${USR_RO[@]}" "$NAME" /bin/sh -c 'cat <&3' 3<"$FDFILE" 2>/dev/null)"
-check "inherited fd is readable inside the guest" "fd-payload-42" "$result"
-
-# 6b. inherited fd also survives a clean environment
-result="$("$CRT" run --clean-env "${USR_RO[@]}" "$NAME" /bin/sh -c 'cat <&3' 3<"$FDFILE" 2>/dev/null)"
-check "inherited fd survives --clean-env" "fd-payload-42" "$result"
 
 echo
 echo "passed $pass, failed $fail"

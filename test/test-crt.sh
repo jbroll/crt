@@ -7,6 +7,11 @@ MOCKS="$SCRIPT_DIR/mocks"
 
 export PATH="$MOCKS:$PATH"
 
+# The mocks provide no real mount namespace, so the mock pivot_root always fails.
+# CRT_TEST_MODE lets cmd_run fall back to chroot (and skip ro verification) instead
+# of aborting. It is a test-only switch; real runs never set it.
+export CRT_TEST_MODE=1
+
 . "$SCRIPT_DIR/Test"
 
 # Per-test temp home; cleaned on exit
@@ -446,7 +451,7 @@ read_cfg_field() {
 $(awk '/^read_config\(\)/,/^\}/' "$CRT")
 config_image='' config_memory='' config_cpus=''
 config_net='' config_home='' config_tmp='' config_envclean='' config_root=''
-config_mounts=() config_envs=() config_packages=()
+config_mounts=() config_envs=() config_packages=() config_keepfds=()
 read_config '$CONF'
 $expr
 "
@@ -591,15 +596,44 @@ Test "run: -e for an unset var warns and is skipped"
 warn=$("$CRT" run --clean-env -e DEFINITELY_UNSET_VAR isoenv true 2>&1 >/dev/null || true)
 if echo "$warn" | grep -q "not set in environment"; then Pass; else Fail; fi
 
-# ── cmd_run: inherited file descriptors ───────────────────────────────────────
-echo "# cmd_run inherited fds"
+# ── cmd_run: file descriptors ─────────────────────────────────────────────────
+echo "# cmd_run file descriptors"
 
-Test "run: an inherited fd survives into the command"
-result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'fd-payload' 2>/dev/null)
+Test "run: --keep-fd keeps the listed fd open"
+result=$("$CRT" run --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'fd-payload' 2>/dev/null)
 CompareArgs "$result" "fd-payload"
 
-Test "run: an inherited fd survives a clean env too"
-result=$("$CRT" run --clean-env isoenv sh -c 'cat <&3' 3<<<'clean-fd' 2>/dev/null)
+Test "run: --keep-fd works with a clean env"
+result=$("$CRT" run --clean-env --keep-fd 3 isoenv sh -c 'cat <&3' 3<<<'clean-fd' 2>/dev/null)
 CompareArgs "$result" "clean-fd"
+
+Test "run: an unlisted fd is closed"
+result=$("$CRT" run isoenv sh -c 'cat <&3 2>/dev/null && echo LEAK || echo closed' 3<<<'secret' 2>/dev/null)
+CompareArgs "$result" "closed"
+
+Test "run: -e NODE_CHANNEL_FD keeps that fd open automatically"
+result=$(NODE_CHANNEL_FD=3 "$CRT" run --clean-env -e NODE_CHANNEL_FD isoenv sh -c 'cat <&3' 3<<<'ipc-msg' 2>/dev/null)
+CompareArgs "$result" "ipc-msg"
+
+Test "run: keep-fd directive from config keeps the fd open"
+printf 'keep-fd 3\n' > "$CRT_HOME/isoenv/config"
+result=$("$CRT" run isoenv sh -c 'cat <&3' 3<<<'cfg-fd' 2>/dev/null)
+CompareArgs "$result" "cfg-fd"
+printf '' > "$CRT_HOME/isoenv/config"
+
+Test "run: --keep-fd rejects a non-numeric value"
+err=$("$CRT" run --keep-fd abc isoenv true 2>&1 || true)
+if echo "$err" | grep -q "must be a number"; then Pass; else Fail; fi
+
+# ── read_config: keep-fd directive ────────────────────────────────────────────
+echo "# read_config keep-fd"
+
+Test "read_config: keep-fd single"
+CompareArgs "$(read_cfg_field 'keep-fd 3
+' 'echo "${#config_keepfds[@]} ${config_keepfds[*]}"')" "1 3"
+
+Test "read_config: keep-fd multiple"
+CompareArgs "$(read_cfg_field 'keep-fd 3 4 5
+' 'echo "${#config_keepfds[@]}"')" "3"
 
 TestDone
