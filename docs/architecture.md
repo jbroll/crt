@@ -71,11 +71,23 @@ registry over HTTPS; its digests tie the layers to it.
 
 A digest only proves the registry sent the layer the manifest names, not that
 the layer is benign, so every layer is checked before anything is deleted or
-extracted. `_oci_check_layer` lists the layer (`tar -tv`, escape quoting) and
-refuses it if any member name or hardlink target is absolute, has a `..`
-component, needs escaping (a backslash in the listing), or has a parent path
-that runs through a symlink, whether the symlink comes from this layer or
-already exists in the rootfs from a lower layer. That last rule is the one
+extracted. `_oci_check_layer` refuses a layer if any member name or hardlink
+target is absolute, has a `..` component, needs escaping (a backslash in the
+listing), or has a parent path that runs through a symlink, whether the
+symlink comes from this layer or already exists in the rootfs from a lower
+layer.
+
+Member names come from `tar -t`, one exact escaped name per line, never from
+splitting `tar -tv` text: there a name containing ` -> ` or ` link to ` is
+indistinguishable from the separator, which let a crafted layer write through
+a symlink or hardlink a host file into the rootfs. The verbose listing, in the
+same order, supplies only each entry's type, and a hardlink target is the text
+after the exact name and ` link to `; any disagreement between the two
+listings refuses the layer. Both listings run under `LC_ALL=C.UTF-8`, so
+ordinary non-ASCII names print literally and extract; anything tar still
+escapes (control characters, invalid UTF-8, a backslash, or all non-ASCII when
+that locale is missing) is refused, which fails closed. The time field
+accepts PAX sub-second values. That last rule is the one
 tar does not enforce: GNU tar refuses `..` members, strips a leading `/`, and
 defers symlinks whose targets are absolute or contain `..` to the end of the
 archive, but it follows a symlink that a lower layer left behind. Image
@@ -286,6 +298,9 @@ own in case either is a symlink out of `CRT_HOME`.
 - Rename-and-back and inode reuse after a manual `rm`/`mkdir` give a stale
   pristine marker (above). Recreate with `crt rm` then `crt create`.
 - A hardlinked legacy config keeps sharing its inode after migration (above).
+- `--keep-fd N` passes an open descriptor through unchanged. A directory fd the
+  operator opened on `CRT_HOME` would reach it from a hardened run; that is an
+  operator action.
 - Exported functions named like the bash builtins `crt` uses to drop
   inherited functions (`compgen`, `unset`, `builtin`, `command`, `declare`)
   can still shadow them. Only the environment that invokes `crt` can set
@@ -344,8 +359,11 @@ through an ancestor), and a default (non-hardened) run is unchanged.
 
 The OCI containment rules are tested in the mock suite with crafted layers
 (`test/mklayer.py`, needs python3): `..` and absolute members, whiteouts and
-hardlinks with `..`, and files, hardlinks and whiteouts through a symlink
-created in the same layer or a lower one. Each must fail the create and
+hardlinks with `..`, files, hardlinks and whiteouts through a symlink
+created in the same layer or a lower one, the same through members whose
+names contain ` -> ` or ` link to `, and names tar must escape. Harmless
+names containing those phrases, non-ASCII names (under `LC_ALL=C`) and PAX
+sub-second mtimes must still extract. Each must fail the create and
 leave a file outside the rootfs untouched; a benign layered image with
 whiteouts and symlinks must still unpack. It
 self-skips when unprivileged user namespaces aren't available on the host.

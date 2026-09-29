@@ -462,6 +462,35 @@ if command -v python3 >/dev/null 2>&1; then
     python3 "$MKL" "$LAY/hdd.tgz" "f:a" "h:hl:$REL/victim"
     oci_escape_test ocihd "a hardlink target with '..'" "$LAY/hdd.tgz"
 
+    # The verifier's layers: names containing " -> " / " link to " used to be
+    # split at the wrong place in the `tar -tv` text.
+    python3 "$MKL" "$LAY/o1.tgz" "l:s2 -> q:lnk" "f:s2 -> q/pwn1"
+    oci_escape_test ocio1 "a file through a symlink whose name contains ' -> '" "$LAY/l1.tgz" "$LAY/o1.tgz"
+
+    python3 "$MKL" "$LAY/o1c.tgz" "l:s2 -> q:lnk" "d:s2 -> q/sub" "f:s2 -> q/sub/pwn1c"
+    oci_escape_test ocio1c "a nested file through a ' -> '-named symlink" "$LAY/l1.tgz" "$LAY/o1c.tgz"
+
+    python3 "$MKL" "$LAY/o2.tgz" "h:a link to b:lnk/victim"
+    oci_escape_test ocio2 "a hardlink whose name contains ' link to '" "$LAY/l1.tgz" "$LAY/o2.tgz"
+
+    Test "OCI: harmless names containing ' -> ' and ' link to ' still extract"
+    python3 "$MKL" "$LAY/n1.tgz" "f:weird -> name" "f:x link to y" "f:plain"
+    CRT_MOCK_LAYERS="$LAY/n1.tgz" "$CRT" create ociodd alpine:3.19 >/dev/null 2>&1
+    if [ -f "$CRT_HOME/ociodd/weird -> name" ] && [ -f "$CRT_HOME/ociodd/x link to y" ]; then Pass; else Fail; fi
+
+    Test "OCI: non-ASCII names extract, even with LC_ALL=C"
+    python3 "$MKL" "$LAY/u1.tgz" "d:usr" "f:usr/café.txt"
+    LC_ALL=C CRT_MOCK_LAYERS="$LAY/u1.tgz" "$CRT" create ociutf8 alpine:3.19 >/dev/null 2>&1
+    if [ -f "$CRT_HOME/ociutf8/usr/café.txt" ]; then Pass; else Fail; fi
+
+    Test "OCI: a PAX layer with sub-second mtimes extracts"
+    python3 "$MKL" --pax "$LAY/p1.tgz" "d:etc" "f:etc/pax.txt"
+    CRT_MOCK_LAYERS="$LAY/p1.tgz" "$CRT" create ocipax alpine:3.19 >/dev/null 2>&1
+    if [ -f "$CRT_HOME/ocipax/etc/pax.txt" ]; then Pass; else Fail; fi
+
+    python3 "$MKL" "$LAY/ctl.tgz" "$(printf 'f:bad\tname')"
+    oci_escape_test ocictl "a name tar must escape (control character)" "$LAY/ctl.tgz"
+
     Test "OCI: a benign layered image with whiteouts and symlinks still unpacks"
     python3 "$MKL" "$LAY/b1.tgz" "d:a" "f:a/old" "d:usr" "d:usr/bin" "f:usr/bin/sh" "l:bin:usr/bin"
     python3 "$MKL" "$LAY/b2.tgz" "f:a/.wh.old" "f:usr/bin/new" "l:link2:/usr/bin/new"

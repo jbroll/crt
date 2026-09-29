@@ -192,7 +192,7 @@ crt create myapp ghcr.io/user/myapp:latest
 crt create staging quay.io/org/service:v2.1
 ```
 
-Supported registries: Docker Hub, ghcr.io, quay.io, and any registry implementing the OCI Distribution Spec. Public images only (no credential support). Multi-arch image indexes are handled — the layer matching the host architecture is selected automatically. Every layer blob is checked against its manifest's sha256 digest, both after download and before a cached copy is reused; a mismatch aborts the create (download) or refetches (cache). Each layer is also checked before it is applied: a member or hardlink target that is absolute, contains `..`, or runs through a symlink (from this layer or a lower one), or a whiteout that would reach outside the rootfs, aborts the create.
+Supported registries: Docker Hub, ghcr.io, quay.io, and any registry implementing the OCI Distribution Spec. Public images only (no credential support). Multi-arch image indexes are handled — the layer matching the host architecture is selected automatically. Every layer blob is checked against its manifest's sha256 digest, both after download and before a cached copy is reused; a mismatch aborts the create (download) or refetches (cache). Each layer is also checked before it is applied: a member or hardlink target that is absolute, contains `..`, or runs through a symlink (from this layer or a lower one), or a whiteout that would reach outside the rootfs, aborts the create. Member names are read exactly from `tar -t` (never split out of `tar -tv` text, where a name containing ` -> ` or ` link to ` is ambiguous), under a UTF-8 locale so non-ASCII names extract; a name tar still has to escape is refused.
 
 ## Running commands
 
@@ -350,14 +350,16 @@ read-only verification when the mock `pivot_root` fails. Any other value does
 nothing. The suite keeps `CRT_HOME` under `/var/tmp`, and a `crt_run` helper
 re-marks the mock rootfs pristine before each run (standing in for `crt
 create`). This lets the full `cmd_create` and `cmd_run` code paths run without
-root, namespaces, network, or xbps. 153 tests cover `parse_memory`,
+root, namespaces, network, or xbps. 160 tests cover `parse_memory`,
 `read_config` (including the
 `net`/`home`/`tmp`/`env-clean`/`root`/`packages`/`keep-fd` directives),
 `write_config`, `parse_image_ref`, all three `create` dispatch paths (with the
 `xbps-install -S` / key-copy / `/dev/null`-stdin path), OCI digest checks on
 download and cache reuse, OCI layer containment against crafted layers
 (`..`/absolute members, escaping whiteouts and hardlinks, paths through
-same-layer and lower-layer symlinks; these need python3), hardened binds of
+same-layer and lower-layer symlinks, member names containing ` -> ` or
+` link to `; plus non-ASCII names and PAX sub-second mtimes that must still
+extract; these need python3), hardened binds of
 `CRT_HOME`/`.config`/`.state`, `run` flag and config merging, the generated
 `unshare`/`mount` calls for each isolation flag, clean-env behavior,
 `--keep-fd`/fd closing and the `NODE_CHANNEL_FD` guards, the test-mode switch,

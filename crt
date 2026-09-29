@@ -361,7 +361,7 @@ oci_unpack() {
             else
                 rm -rf -- "${wh_parent:?}/${wh_name#.wh.}"
             fi
-        done < <(tar --quoting-style=escape -tzf "$blob" 2>/dev/null | grep '\.wh\.' || true)
+        done < <(LC_ALL=C.UTF-8 tar --quoting-style=escape -tzf "$blob" 2>/dev/null | grep '\.wh\.' || true)
 
         # Extract. GNU tar also refuses '..' members, strips a leading '/', and
         # defers symlinks whose target is absolute or contains '..' until the
@@ -380,27 +380,53 @@ oci_unpack() {
 # escaping in tar's listing, and any whose parent path runs through a symlink:
 # one already in ROOTFS from a lower layer, or one this layer creates. Image
 # layers record files at their real paths, so ordinary builds are unaffected.
+#
+# Names come from `tar -t` (one exact, escaped name per line), never from
+# splitting the `tar -tv` text, where " -> " and " link to " inside a name are
+# indistinguishable from the separators. The verbose listing, in the same
+# order, supplies only the type; a hardlink target is what follows the exact
+# name and " link to ". Listings run under a UTF-8 locale so ordinary
+# non-ASCII names print literally; whatever tar still escapes (control
+# characters, invalid UTF-8, a backslash, or everything non-ASCII when the
+# locale is missing) is refused.
 _oci_check_layer() {
     local rootfs="$1" blob="$2"
-    local listing line kind rest name tgt i
-    local -a names=() kinds=() targets=()
+    local names_out verbose_out line kind rest name tail tgt i
+    local -a raw=() vlines=() names=() kinds=() targets=()
     local -A lsym=() islink=()
 
-    listing=$(tar --numeric-owner --full-time --quoting-style=escape -tvzf "$blob") || return 1
-    local re='^(.)[^ ]* +[^ ]+ +[^ ]+ +[0-9-]+ +[0-9:]+ (.*)$'
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
+    names_out=$(LC_ALL=C.UTF-8 tar --quoting-style=escape -tzf "$blob") || return 1
+    verbose_out=$(LC_ALL=C.UTF-8 tar --numeric-owner --full-time \
+                    --quoting-style=escape -tvzf "$blob") || return 1
+    mapfile -t raw <<< "$names_out"
+    mapfile -t vlines <<< "$verbose_out"
+    if [ "${#raw[@]}" -ne "${#vlines[@]}" ]; then
+        echo "  tar listings disagree on the member count" >&2; return 1
+    fi
+
+    # perms, uid/gid, size (or major,minor), date, time (PAX may add .fraction)
+    local re='^(.)[^ ]* +[^ ]+ +[^ ]+ +[0-9-]+ +[0-9:.]+ (.*)$'
+    for (( i = 0; i < ${#raw[@]}; i++ )); do
+        name="${raw[i]}"; line="${vlines[i]}"
+        if [ -z "$name" ] && [ -z "$line" ]; then continue; fi
         [[ "$line" =~ $re ]] || { echo "  unparsable tar entry: $line" >&2; return 1; }
         kind="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"; tgt=""
+        if [ "${rest:0:${#name}}" != "$name" ]; then
+            echo "  tar listings disagree on member $name" >&2; return 1
+        fi
+        tail="${rest:${#name}}"
         case "$kind" in
-            l) name="${rest%% -> *}" ;;
-            h) name="${rest%% link to *}"; tgt="${rest#* link to }" ;;
-            *) name="$rest" ;;
+            l) [[ "$tail" == " -> "* ]] \
+                   || { echo "  bad symlink entry: $line" >&2; return 1; } ;;
+            h) [[ "$tail" == " link to "* ]] \
+                   || { echo "  bad hardlink entry: $line" >&2; return 1; }
+               tgt="${tail#" link to "}" ;;
+            *) [ -z "$tail" ] || { echo "  unexpected tar entry: $line" >&2; return 1; } ;;
         esac
         name="${name#./}"; name="${name%/}"; tgt="${tgt#./}"
         names+=("$name"); kinds+=("$kind"); targets+=("$tgt")
         if [ "$kind" = l ]; then lsym["$name"]=1; fi
-    done <<< "$listing"
+    done
 
     for (( i = 0; i < ${#names[@]}; i++ )); do
         if [ -z "${names[i]}" ] || [ "${names[i]}" = . ]; then continue; fi
